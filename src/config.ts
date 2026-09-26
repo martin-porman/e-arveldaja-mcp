@@ -4,6 +4,7 @@ import { resolve, win32 } from "path";
 import { readFileSync, existsSync, statSync, readdirSync, realpathSync, lstatSync, writeFileSync, mkdirSync, chmodSync, renameSync, unlinkSync } from "fs";
 import { homedir } from "os";
 import { exposureForProfile, LEGACY_TOOL_EXPOSURE_ENV_KEYS, parseToolProfile, type ToolProfile } from "./tool-profile.js";
+import { crmNamedConfig } from "./crm/crm-config.js";
 export interface Config {
   apiKeyId: string;
   apiPublicValue: string;
@@ -139,6 +140,11 @@ function getBaseUrl(): string {
 }
 
 export function getBaseUrlForServer(server = process.env.EARVELDAJA_SERVER || "live"): string {
+  if (server === "crm") {
+    const baseUrl = process.env.CRM_API_URL;
+    if (!baseUrl) throw new Error("CRM_API_URL is required for the crm server target.");
+    return baseUrl;
+  }
   if (!(server in SERVERS)) {
     throw new Error(`Invalid EARVELDAJA_SERVER="${server}". Must be "live" or "demo".`);
   }
@@ -1048,6 +1054,9 @@ export async function importApiKeyCredentials(
  * local bootstrap/import source for the current working directory.
  */
 export function loadAllConfigs(): NamedConfig[] {
+  const crm = crmNamedConfig(process.env);
+  if (crm) return [crm];
+
   const baseUrl = getBaseUrl();
   const configs: NamedConfig[] = [];
   const seen = new Set<string>();

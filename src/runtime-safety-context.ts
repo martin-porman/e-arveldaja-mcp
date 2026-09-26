@@ -11,7 +11,7 @@ import { WorkflowStateStore, type WorkflowStateStoreOptions } from "./workflow-s
 import type { ToolProfile } from "./tool-profile.js";
 import { TOOL_CATALOG_FINGERPRINT } from "./tool-catalog.js";
 
-export type RuntimeEnvironmentKind = "live" | "demo" | "setup";
+export type RuntimeEnvironmentKind = "live" | "demo" | "crm" | "setup";
 
 export interface RuntimeSafetyScope {
   readonly serverInstanceId: string;
@@ -126,6 +126,7 @@ function normalizeBaseUrl(baseUrl: string): string {
 }
 
 function environmentKind(baseUrl: string): Exclude<RuntimeEnvironmentKind, "setup"> {
+  if (process.env.CRM_API_URL && baseUrl === normalizeBaseUrl(process.env.CRM_API_URL)) return "crm";
   if (baseUrl === normalizeBaseUrl(getBaseUrlForServer("demo"))) return "demo";
   if (baseUrl === normalizeBaseUrl(getBaseUrlForServer("live"))) return "live";
   throw new Error("Runtime safety context received an unknown live/demo connection URL.");

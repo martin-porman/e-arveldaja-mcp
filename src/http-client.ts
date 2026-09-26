@@ -1,6 +1,5 @@
 import type { Config } from "./config.js";
-import { createAuthHeaders } from "./auth.js";
-import { wrapUntrustedOcr } from "./mcp-json.js";
+import { sandboxExternalText } from "./external-text-renderer.js";
 import { buildConnectionFingerprint } from "./connection-fingerprint.js";
 
 export type HttpMethod = "GET" | "POST" | "PUT" | "PATCH" | "DELETE";
@@ -16,11 +15,10 @@ export type HttpMethod = "GET" | "POST" | "PUT" | "PATCH" | "DELETE";
  */
 export class HttpError extends Error {
   /**
-   * Upstream body.messages joined text, already OCR-sandbox-wrapped so a
-   * downstream LLM treats it as untrusted data. Present only when the
-   * upstream returned a structured JSON body with `messages`. Kept off
-   * `Error.message` so audit logs / stderr remain clean; tool-error
-   * serialization forwards this property to the MCP response.
+   * Upstream body.error/refused text, already sandbox-wrapped so a
+   * downstream LLM treats it as untrusted data. Kept off `Error.message` so
+   * audit logs / stderr remain clean; tool-error serialization forwards this
+   * property to the MCP response.
    */
   readonly upstream_detail?: string;
   readonly recovery_hint?: string;
@@ -104,163 +102,6 @@ export class HttpClient {
     return status === 429 || (method === "GET" && status >= 500);
   }
 
-  private static getResourceName(path: string): string | undefined {
-    return path.split("?")[0]!.split("/").filter(Boolean)[0];
-  }
-
-  private static getPathId(path: string): number | undefined {
-    const raw = path.split("?")[0]!.split("/").filter(Boolean)[1];
-    if (!raw) return undefined;
-    const parsed = Number(raw);
-    return Number.isInteger(parsed) && parsed > 0 ? parsed : undefined;
-  }
-
-  private static listActionForPath(path: string): { tool: string; why: string } | undefined {
-    switch (HttpClient.getResourceName(path)) {
-      case "clients":
-        return { tool: "list_clients", why: "List clients and verify the target client ID." };
-      case "products":
-        return { tool: "list_products", why: "List products and verify the target product ID." };
-      case "journals":
-        return { tool: "list_journals", why: "List journals and verify the target journal ID/status." };
-      case "transactions":
-        return { tool: "list_transactions", why: "List transactions and verify the target transaction ID/status." };
-      case "sale_invoices":
-        return { tool: "list_sale_invoices", why: "List sale invoices and verify the target invoice ID/status." };
-      case "purchase_invoices":
-        return { tool: "list_purchase_invoices", why: "List purchase invoices and verify the target invoice ID/status." };
-      default:
-        return undefined;
-    }
-  }
-
-  private static recoveryActionsForNotFound(path: string): Array<{ tool: string; args?: Record<string, unknown>; why: string }> {
-    const id = HttpClient.getPathId(path);
-    const listAction = HttpClient.listActionForPath(path);
-    const actions: Array<{ tool: string; args?: Record<string, unknown>; why: string }> = [];
-
-    if (id !== undefined) {
-      const resource = HttpClient.getResourceName(path);
-      const singular = resource?.endsWith("s") ? resource.slice(0, -1) : resource;
-      if (singular && ["client", "product", "journal", "transaction"].includes(singular)) {
-        actions.push({
-          tool: `get_${singular}`,
-          args: { id },
-          why: "Re-read the record by ID to confirm whether it still exists.",
-        });
-      }
-      if (resource === "sale_invoices") {
-        actions.push({ tool: "get_sale_invoice", args: { id }, why: "Re-read the sale invoice by ID." });
-      }
-      if (resource === "purchase_invoices") {
-        actions.push({ tool: "get_purchase_invoice", args: { id }, why: "Re-read the purchase invoice by ID." });
-      }
-    }
-
-    if (HttpClient.getResourceName(path) === "clients") {
-      actions.push(
-        { tool: "search_client", args: { name: "<client name>" }, why: "Search by name when the stored client ID may be stale." },
-        { tool: "find_client_by_code", args: { code: "<registry code>" }, why: "Find the current client by registry code." },
-      );
-    }
-    if (listAction) actions.push(listAction);
-    return actions;
-  }
-
-  private static recoveryActionsForValidation(path: string): Array<{ tool: string; args?: Record<string, unknown>; why: string }> {
-    const actions: Array<{ tool: string; args?: Record<string, unknown>; why: string }> = [
-      { tool: "list_accounts", why: "Verify account IDs and whether the account requires dimensions." },
-      { tool: "list_account_dimensions", why: "Find required sub-account/dimension IDs for dimensional accounts." },
-      { tool: "get_vat_info", why: "Check VAT registration before retrying invoice or VAT-sensitive postings." },
-    ];
-
-    switch (HttpClient.getResourceName(path)) {
-      case "purchase_invoices":
-        actions.push({ tool: "list_purchase_articles", why: "Verify purchase article and VAT article IDs." });
-        break;
-      case "sale_invoices":
-        actions.push({ tool: "list_sale_articles", why: "Verify sale article and VAT/account defaults." });
-        break;
-      case "transactions":
-        actions.push({ tool: "get_transaction", args: { id: HttpClient.getPathId(path) ?? "<transaction id>" }, why: "Inspect the transaction before retrying confirmation/update." });
-        break;
-    }
-
-    return actions;
-  }
-
-  private static recoveryActionsForConflict(path: string): Array<{ tool: string; args?: Record<string, unknown>; why: string }> {
-    const actions: Array<{ tool: string; args?: Record<string, unknown>; why: string }> = [];
-    switch (HttpClient.getResourceName(path)) {
-      case "purchase_invoices":
-        actions.push({
-          tool: "detect_duplicate_purchase_invoice",
-          args: { invoice_number: "<invoice number>", gross_price: "<gross price>", invoice_date: "<YYYY-MM-DD>" },
-          why: "Check whether the invoice already exists before retrying creation.",
-        });
-        break;
-      case "transactions":
-        actions.push({ tool: "reconcile_bank_transactions", args: { mode: "suggest", min_confidence: 30 }, why: "Check whether the transaction is already matched or conflicts with another booking." });
-        break;
-    }
-    const listAction = HttpClient.listActionForPath(path);
-    if (listAction) actions.push(listAction);
-    return actions;
-  }
-
-  private static buildRecoveryAdvice(
-    status: number,
-    method: HttpMethod,
-    path: string,
-  ): { recovery_hint?: string; next_actions?: Array<{ tool: string; args?: Record<string, unknown>; why: string }> } {
-    switch (status) {
-      case 400:
-      case 422:
-        return {
-          recovery_hint:
-            "Validate the request body before retrying. Common causes are missing required fields, invalid date format, invoice total mismatches, inactive accounts, or missing account dimensions.",
-          next_actions: HttpClient.recoveryActionsForValidation(path),
-        };
-      case 401:
-        return {
-          recovery_hint:
-            "Check API credentials and the allowed public IP address. Restart the MCP server after changing stored credentials.",
-          next_actions: [
-            { tool: "get_setup_instructions", why: "Review the credential sources and import options for this working directory." },
-            { tool: "list_connections", why: "Verify which company connection is currently active." },
-          ],
-        };
-      case 403:
-        return {
-          recovery_hint:
-            "Check API token permissions, company access, and whether the active connection points to the intended company.",
-          next_actions: [
-            { tool: "list_connections", why: "Confirm the active company connection before retrying." },
-            { tool: "get_setup_instructions", why: "Review credential setup and storage scope." },
-          ],
-        };
-      case 404:
-        return {
-          recovery_hint:
-            "Verify that the referenced record still exists and is not deleted, voided, or in another company connection.",
-          next_actions: HttpClient.recoveryActionsForNotFound(path),
-        };
-      case 409:
-        return {
-          recovery_hint:
-            "Resolve the conflict before retrying. This often means a duplicate record, stale status, or an operation that must happen in a different order.",
-          next_actions: HttpClient.recoveryActionsForConflict(path),
-        };
-      case 429:
-        return {
-          recovery_hint:
-            "Wait before retrying. The upstream API is rate-limiting requests; reduce batch size or retry the same tool after a short delay.",
-        };
-      default:
-        return {};
-    }
-  }
-
   private static isRetryableError(error: unknown): boolean {
     return error instanceof Error && (
       error.name === "AbortError" ||
@@ -285,14 +126,14 @@ export class HttpClient {
     // Only surface the error NAME and a known error CODE — never the raw
     // message. Node's fetch echoes offending values into the message for some
     // failures (e.g. an invalid header value includes the header content), so a
-    // malformed apiPublicValue / signature could otherwise leak into
-    // HttpError.message, stderr, and the stderr tee.
+    // malformed bearer token could otherwise leak into HttpError.message,
+    // stderr, and the stderr tee.
     const name = error instanceof Error ? error.name : "";
     const code = typeof (error as { code?: unknown })?.code === "string" ? (error as { code: string }).code : "";
     const detail = [name, code].filter(Boolean).join(" ");
     const suffix = detail ? `: ${detail}` : "";
     return new HttpError(
-      `API request failed: ${method} ${path} → network error${suffix}`,
+      `CRM request failed: ${method} ${path} → network error${suffix}`,
       "network",
       method,
       path,
@@ -302,7 +143,6 @@ export class HttpClient {
   async request<T = unknown>(path: string, options: RequestOptions = {}): Promise<T> {
     const { method = "GET", body, params } = options;
 
-    // Build full URL: baseUrl already includes /v1
     const fullUrl = `${this.config.baseUrl}${path}`;
     const url = new URL(fullUrl);
     if (params) {
@@ -313,22 +153,17 @@ export class HttpClient {
       }
     }
 
-    // Sign with path only (no query params)
-    const signingPath = url.pathname;
-
     for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
       this.assertRequestAllowed();
 
-      // Fresh auth headers for each attempt (timestamp must be current)
-      const authHeaders = createAuthHeaders(this.config, signingPath);
-
       const headers: Record<string, string> = {
-        ...authHeaders,
+        Authorization: `Bearer ${this.config.apiPassword}`,
+        "Content-Type": "application/json",
         Accept: "application/json",
       };
-
-      if (body !== undefined) {
-        headers["Content-Type"] = "application/json";
+      const stepToken = process.env.CRM_STEP_TOKEN;
+      if (stepToken) {
+        headers["X-CRM-Step-Token"] = stepToken;
       }
 
       await this.waitForRateLimitTurn();
@@ -345,10 +180,9 @@ export class HttpClient {
             headers,
             body: body !== undefined ? JSON.stringify(body) : undefined,
             signal: controller.signal,
-            // Never auto-follow redirects: fetch would forward the custom
-            // X-AUTH-* headers (public value + HMAC signature) to the redirect
-            // target, and the signature — which signs only the ORIGINAL path —
-            // could be captured/replayed. A trusted HTTPS API does not redirect.
+            // Never auto-follow redirects: fetch would forward the bearer
+            // Authorization header and the step token to the redirect target.
+            // A trusted internal CRM API does not redirect.
             redirect: "manual",
           });
         } catch (error) {
@@ -369,7 +203,7 @@ export class HttpClient {
         // fall through as a generic error — the auth headers were NOT forwarded.
         if (response.type === "opaqueredirect" || (response.status >= 300 && response.status < 400)) {
           throw new HttpError(
-            `API request failed: ${method} ${path} → unexpected redirect refused (auth headers not forwarded)`,
+            `CRM request failed: ${method} ${path} → unexpected redirect refused (auth headers not forwarded)`,
             response.status || 502,
             method,
             path,
@@ -383,36 +217,21 @@ export class HttpClient {
             continue;
           }
 
-          // Parse structured error if available. Upstream API messages may
-          // echo user-supplied content (invoice notes, supplier names), so
-          // we keep `Error.message` free of raw upstream text and stash the
+          // The CRM may echo user-supplied content in its refusal (e.g. a
+          // manifest reason quoting a supplied field), so we keep
+          // `Error.message` free of raw upstream text and stash the
           // sandbox-wrapped detail on a dedicated property for MCP output.
-          // Audit logs and stderr show only the clean top-line; the LLM sees
-          // the detail through tool-error serialization, sandboxed.
-          let errorMessage = `API request failed: ${method} ${path} → ${response.status}`;
           let upstreamDetail: string | undefined;
           try {
-            const body = await response.json() as { code?: number; messages?: string[] };
-            if (body.messages && Array.isArray(body.messages)) {
-              const msgs = body.messages.join("; ").substring(0, 500);
-              upstreamDetail = wrapUntrustedOcr(msgs);
-            }
+            const errorBody = await response.json() as { error?: string; refused?: string[] };
+            const detail = errorBody.error ?? errorBody.refused?.join("; ") ?? "";
+            upstreamDetail = sandboxExternalText(detail);
           } catch {
             // Non-JSON error body — don't expose raw text
           }
 
-          if (response.status === 401) {
-            errorMessage += `\n\nTroubleshooting 401 Unauthorized:\n` +
-              `  1. Is the API key downloaded and configured? Check apikey*.txt or environment variables.\n` +
-              `  2. Is this machine's public IP address allowed in e-arveldaja API settings?\n` +
-              `     Find the current public IP locally (for example, open https://api.ipify.org in your browser) ` +
-              `and add it to: e-arveldaja → Seaded → API võtmed → Lubatud IP-aadressid\n` +
-              `     Multiple IP addresses can be added, separated by ;`;
-          }
-
-          throw new HttpError(errorMessage, response.status, method, path, {
+          throw new HttpError(`CRM ${response.status} on ${method} ${path}`, response.status, method, path, {
             upstream_detail: upstreamDetail,
-            ...HttpClient.buildRecoveryAdvice(response.status, method, path),
           });
         }
 
@@ -426,8 +245,8 @@ export class HttpClient {
           // `finally` clears only AFTER the body is fully read — otherwise a
           // stalled body hangs forever. A body-read failure (connection dropped
           // mid-body after a committed mutation) is classified as a network
-          // error so ambiguous-write recovery (TransactionsApi.confirm) treats
-          // it as an indeterminate commit rather than a raw TypeError.
+          // error so ambiguous-write recovery treats it as an indeterminate
+          // commit rather than a raw TypeError.
           try {
             return await response.json() as T;
           } catch (bodyError) {
@@ -437,16 +256,15 @@ export class HttpClient {
 
         // Binary response (e.g. PDF document download) — return as ApiFile-compatible object.
         // Cap buffered size to prevent OOM if the upstream returns an
-        // unexpectedly large payload. Invoice PDFs are tiny (<1MB); keep a
-        // generous ceiling for occasional legitimate bulk downloads.
+        // unexpectedly large payload.
         //
         // Caveat: against a hostile/buggy upstream the post-buffer check is
         // reached only AFTER `arrayBuffer()` has already allocated the full
         // body, so it does not prevent memory pressure from a streamed
         // 1 GB body lacking a truthful content-length. A real cap requires
         // streaming the body and aborting once cumulative bytes exceed the
-        // limit. Defensible today because e-arveldaja is a trusted upstream
-        // under HTTPS; treat this as defense-in-depth, not attacker-proof.
+        // limit. Defensible today because the CRM is a trusted internal
+        // upstream; treat this as defense-in-depth, not attacker-proof.
         const BINARY_RESPONSE_MAX_BYTES = 50 * 1024 * 1024; // 50 MB
         const contentLengthHeader = response.headers.get("content-length");
         if (contentLengthHeader) {
@@ -480,7 +298,7 @@ export class HttpClient {
     }
 
     throw new HttpError(
-      `API request failed: ${method} ${path} → retries exhausted`,
+      `CRM request failed: ${method} ${path} → retries exhausted`,
       "network",
       method,
       path,
@@ -492,6 +310,10 @@ export class HttpClient {
 
   async post<T = unknown>(path: string, body: unknown): Promise<T> {
     return this.request<T>(path, { method: "POST", body });
+  }
+
+  async put<T = unknown>(path: string, body: unknown): Promise<T> {
+    return this.request<T>(path, { method: "PUT", body });
   }
 
   async patch<T = unknown>(path: string, body: unknown): Promise<T> {

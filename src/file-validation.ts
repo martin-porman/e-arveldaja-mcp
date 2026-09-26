@@ -11,14 +11,28 @@ function resolveAllowedRoots(roots: string[]): string[] {
   });
 }
 
+/** True when the server targets the CRM transport (CRM_API_URL is set). */
+function isCrmTarget(): boolean {
+  return Boolean(process.env.CRM_API_URL);
+}
+
 /**
  * Default root directories for file reads: working directory + OS temp dir.
  * Set EARVELDAJA_ALLOW_HOME=true to also include $HOME.
  * Override entirely with EARVELDAJA_ALLOWED_PATHS (platform-delimited list).
  * Roots are resolved through symlinks so that the check works even if
  * e.g. the temp dir is a symlink on macOS.
+ *
+ * (I4) Under the crm target, the ONLY allowed root is the attachment store
+ * (CRM_MCP_ATTACHMENTS, default "/app/uploads"). cwd/tmpdir/$HOME are never
+ * roots and the fork's own override variables are ignored — see
+ * getAllowedRoots and getAllowedRootsStartupWarning.
  */
 function getDefaultRoots(): string[] {
+  if (isCrmTarget()) {
+    const attachmentDir = process.env.CRM_MCP_ATTACHMENTS?.trim() || "/app/uploads";
+    return [attachmentDir];
+  }
   const roots = [process.cwd(), tmpdir()];
   if (process.env.EARVELDAJA_ALLOW_HOME === "true") {
     const home = homedir();
@@ -49,6 +63,12 @@ export function isPathWithinRoot(
 }
 
 export function getAllowedRoots(): string[] {
+  // (I4) Under the crm target the attachment store is the only allowed root;
+  // the fork's own override variables are ignored entirely (never even read).
+  if (isCrmTarget()) {
+    return resolveAllowedRoots(getDefaultRoots());
+  }
+
   const raw = process.env.EARVELDAJA_ALLOWED_PATHS
     ? splitAllowedPaths(process.env.EARVELDAJA_ALLOWED_PATHS).map(p => {
         const resolved = resolve(p);
@@ -62,7 +82,18 @@ export function getAllowedRoots(): string[] {
   return resolveAllowedRoots(raw);
 }
 
+/** Test-only wrapper around the resolved allowed roots (see file-validation.crm.test.ts). */
+export function getAllowedRootsForTesting(): string[] {
+  return getAllowedRoots();
+}
+
 export function getAllowedRootsStartupWarning(): string | undefined {
+  if (isCrmTarget()) {
+    const roots = resolveAllowedRoots(getDefaultRoots());
+    return `File-reading tools can access supported files under ${roots.join(", ")}. ` +
+      "EARVELDAJA_ALLOWED_PATHS and EARVELDAJA_ALLOW_HOME are ignored under the crm target.";
+  }
+
   if (process.env.EARVELDAJA_ALLOWED_PATHS) return undefined;
 
   const roots = resolveAllowedRoots(getDefaultRoots());

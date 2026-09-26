@@ -121,6 +121,15 @@ function forbiddenImportViolations(relativePath: string): string[] {
   return violations;
 }
 
+describe("architecture boundary — only src/api and src/server construct the CRM transport", () => {
+  it("only src/api and src/server construct the CRM transport", () => {
+    const offenders = productionSourceFiles(SOURCE_ROOT)
+      .map((path) => relative(process.cwd(), path).split("\\").join("/"))
+      .filter((f) => !/^src\/(api|server|crm)\//.test(f) && /new HttpClient\(/.test(stripCommentsAndStrings(readFileSync(join(process.cwd(), f), "utf8"))));
+    expect(offenders).toEqual([]);
+  });
+});
+
 describe("architecture boundary — pure domain modules stay free of transport/IO imports", () => {
   const pureFiles = [...PURE_DOMAIN_FILES, ...resolutionModules()];
 
