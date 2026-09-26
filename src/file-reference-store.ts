@@ -2,6 +2,7 @@ import { randomBytes } from "node:crypto";
 import { isAbsolute, resolve } from "node:path";
 import type { RuntimeSafetyScope } from "./runtime-safety-context.js";
 import { cloneAndFreezePlanData } from "./plan-store.js";
+import type { ForkStore, StorePersistence, StoredRecord } from "./crm/persistence.js";
 
 export const FILE_REFERENCE_TTL_MS = 600_000;
 export const MAX_ACTIVE_FILE_REFERENCES = 128;
@@ -61,6 +62,12 @@ export interface FileReferenceStoreOptions {
   readonly referenceFactory?: () => Uint8Array;
   readonly ttlMs?: number;
   readonly maxActive?: number;
+  /** Persist every issued reference through the CRM; `initial` rebuilds the map. No `state` column server-side (spec 07 l.25). */
+  readonly persistence?: {
+    readonly store: ForkStore;
+    readonly sink: StorePersistence;
+    readonly initial: readonly StoredRecord[];
+  };
 }
 
 export interface IssueFileReferenceInput {
@@ -149,6 +156,7 @@ export class FileReferenceStore {
   readonly #referenceFactory: () => Uint8Array;
   readonly #ttlMs: number;
   readonly #maxActive: number;
+  readonly #persistence?: FileReferenceStoreOptions["persistence"];
 
   constructor(options: FileReferenceStoreOptions) {
     this.#getActiveScope = options.getActiveScope;
@@ -156,9 +164,20 @@ export class FileReferenceStore {
     this.#referenceFactory = options.referenceFactory ?? (() => randomBytes(REFERENCE_BYTES));
     this.#ttlMs = options.ttlMs ?? FILE_REFERENCE_TTL_MS;
     this.#maxActive = options.maxActive ?? MAX_ACTIVE_FILE_REFERENCES;
+    this.#persistence = options.persistence;
     if (!Number.isSafeInteger(this.#ttlMs) || this.#ttlMs <= 0 ||
       !Number.isSafeInteger(this.#maxActive) || this.#maxActive <= 0) {
       throw new FileReferenceStoreError("file_reference_data_invalid");
+    }
+    if (this.#persistence) {
+      for (const rec of this.#persistence.initial) {
+        try {
+          const entry = cloneAndFreezePlanData(rec.record) as unknown as StoredFileReference;
+          this.#active.set(rec.handle, entry);
+        } catch {
+          // Corrupt or incompatible persisted record: drop it rather than fail startup.
+        }
+      }
     }
   }
 
@@ -198,14 +217,20 @@ export class FileReferenceStore {
     for (let attempt = 0; attempt < MAX_REFERENCE_ATTEMPTS; attempt += 1) {
       const reference = encodeReference(this.#referenceFactory());
       if (this.#active.has(reference)) continue;
-      this.#active.set(reference, Object.freeze({
+      const entry: StoredFileReference = Object.freeze({
         canonicalPath: input.canonicalPath,
         kind: input.kind,
         operation: input.operation,
         scope,
         issuedAt: now,
         expiresAt: now + this.#ttlMs,
-      }));
+      });
+      this.#active.set(reference, entry);
+      this.#persistence?.sink.save("file_refs", {
+        handle: reference,
+        record: entry,
+        expiresAt: new Date(entry.expiresAt).toISOString(),
+      });
       return reference;
     }
     throw new FileReferenceStoreError("file_reference_collision");

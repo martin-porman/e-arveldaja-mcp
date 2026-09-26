@@ -54,7 +54,8 @@ import {
 import { createInvocationStorage, createScopedApiContext } from "../runtime/invocation-scope.js";
 import { createConnectionState } from "../runtime/connection-manager.js";
 import { createAuditLabelResolver, normalizeAuditCompanyName } from "../runtime/audit-label-resolver.js";
-import { buildRuntimeSafetyContext } from "../runtime/runtime-context.js";
+import { createRuntimeSafetyContext } from "../runtime-safety-context.js";
+import { crmPersistence, fetchIdentity, type StorePersistence, type StoredRecord } from "../crm/persistence.js";
 import {
   buildSetupModePayload,
   createSetupModeApiContext,
@@ -314,12 +315,44 @@ export async function createMcpServer(
   const resolvedProfile = getToolProfileConfig();
   const toolProfile = options.toolProfile ?? resolvedProfile.profile;
   const toolExposure = exposureForProfile(toolProfile, options.toolExposure ?? resolvedProfile.exposure);
-  const runtimeSafetyContext = buildRuntimeSafetyContext({
+
+  // The CRM fork persists its four runtime-safety stores and its stable
+  // server identity through the CRM (Task 26, spec §2.2/§2.5) instead of
+  // keeping them purely in-process. Hydration and the identity fetch happen
+  // once here, before the server can accept a single tool call, and only for
+  // the single "crm" connection this fork's loadAllConfigs() ever produces.
+  const crmConnection = shouldConnect ? allConfigs.find((entry) => entry.name === "crm") : undefined;
+  let persistenceSink: StorePersistence | undefined;
+  let identity: { serverInstanceId: string; cursorSecret: Buffer } | undefined;
+  let planRecords: StoredRecord[] = [];
+  let workflowRecords: StoredRecord[] = [];
+  let fileRefRecords: StoredRecord[] = [];
+  let operationResultRecords: StoredRecord[] = [];
+  if (crmConnection) {
+    const persistenceClient = new HttpClient(crmConnection.config, "fork-persistence");
+    persistenceSink = crmPersistence(persistenceClient);
+    [planRecords, workflowRecords, fileRefRecords, operationResultRecords, identity] = await Promise.all([
+      persistenceSink.load("plans"),
+      persistenceSink.load("workflow_states"),
+      persistenceSink.load("file_refs"),
+      persistenceSink.load("operation_results"),
+      fetchIdentity(persistenceClient),
+    ]);
+  }
+
+  const runtimeSafetyContext = createRuntimeSafetyContext({
     invocationStorage,
     configs: allConfigs,
     toolExposure,
     toolProfile,
     getVerifiedCompanyIdentity: (index) => auditResolver.getVerifiedCompanyIdentity(index),
+    ...(identity ? { serverInstanceId: identity.serverInstanceId, cursorSecret: identity.cursorSecret } : {}),
+    ...(persistenceSink ? {
+      planStore: { persistence: { store: "plans" as const, sink: persistenceSink, initial: planRecords } },
+      workflowStateStore: { persistence: { store: "workflow_states" as const, sink: persistenceSink, initial: workflowRecords } },
+      fileReferenceStore: { persistence: { store: "file_refs" as const, sink: persistenceSink, initial: fileRefRecords } },
+      operationResultStore: { persistence: { store: "operation_results" as const, sink: persistenceSink, initial: operationResultRecords } },
+    } : {}),
   });
 
   const instructions = buildServerInstructions({ setupMode, toolExposure, toolProfile });
@@ -388,7 +421,7 @@ export async function createMcpServer(
   const publicServer = createPublicToolRegistrar(server, toolProfile);
 
   function wrapToolHandler<T extends (...args: any[]) => any>(toolName: string, isReadOnly: boolean, guardConnection: boolean, handler: T): T {
-    return (async (...args: unknown[]) => {
+    const dispatch = (async (...args: unknown[]) => {
       const snapshot = captureSnapshot(connectionState, { toolName, isReadOnly });
       const extra = args.length >= 2 ? args[1] as any : undefined;
       if (guardConnection && args[0] && typeof args[0] === "object") {
@@ -475,6 +508,23 @@ export async function createMcpServer(
           inFlightMutations.delete(snapshot);
         }
       }
+    }) as unknown as T;
+    if (!persistenceSink) return dispatch;
+    // A handle the CRM does not hold must never reach the model: every tool
+    // result — success or already-serialized error — is returned only after
+    // the mutations it queued are confirmed durably stored (Task 26).
+    return (async (...args: unknown[]) => {
+      const result = await dispatch(...args);
+      try {
+        await persistenceSink!.flush();
+      } catch (flushError) {
+        log("error", `Persistence flush failed after tool "${toolName}": ${flushError instanceof Error ? flushError.message : String(flushError)}`);
+        return toolError({
+          category: "persistence_flush_failed",
+          error: "The CRM did not confirm this result was stored durably. Treat this operation's outcome as unconfirmed before retrying.",
+        });
+      }
+      return result;
     }) as unknown as T;
   }
 

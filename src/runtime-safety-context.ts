@@ -50,6 +50,8 @@ export interface CreateRuntimeSafetyContextOptions {
   readonly toolProfile?: ToolProfile;
   readonly catalogFingerprint?: string;
   readonly serverInstanceId?: string;
+  /** The CRM-issued cursor secret (Task 26, `fetchIdentity`); falls back to a fresh random secret when omitted. */
+  readonly cursorSecret?: Uint8Array;
   readonly planStore?: Omit<ExecutionPlanStoreOptions, "getActiveScope">;
   readonly fileReferenceStore?: Omit<FileReferenceStoreOptions, "getActiveScope">;
   readonly operationResultStore?: Omit<OperationResultStoreOptions, "getActiveScope" | "assertConsumedPlan" | "retainConsumedPlan">;
@@ -229,6 +231,9 @@ export function createRuntimeSafetyContext(
     ...options.workflowStateStore,
     getActiveScope,
   });
-  const operationResultPageCursorSecret = randomBytes(32);
+  const operationResultPageCursorSecret = options.cursorSecret ?? randomBytes(32);
+  if (!(operationResultPageCursorSecret instanceof Uint8Array) || operationResultPageCursorSecret.byteLength !== 32) {
+    throw new Error("Runtime safety context received an invalid cursor secret.");
+  }
   return Object.freeze({ serverInstanceId, planStore, fileReferenceStore, operationResultStore, workflowStateStore, operationResultPageCursorSecret, getActiveScope });
 }

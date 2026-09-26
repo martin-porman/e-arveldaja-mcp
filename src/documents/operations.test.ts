@@ -7,6 +7,7 @@ import { parseDocument } from "../document-parser.js";
 import { createAccountingWorkflowApi, fixtureAccount, fixtureClient } from "../__fixtures__/accounting-workflow.js";
 import { createTestRuntimeSafetyContext } from "../__fixtures__/runtime-safety.js";
 import { wrapUntrustedOcr } from "../mcp-json.js";
+import { EXECUTION_PLAN_TTL_MS } from "../plan-store.js";
 import { createAccountingDocumentOperations, ACCOUNTING_DOCUMENT_PLAN_DOMAIN, ACCOUNTING_DOCUMENT_CONFIRM_DOMAIN } from "./operations.js";
 
 vi.mock("../audit-log.js", () => ({ logAudit: vi.fn() }));
@@ -400,7 +401,7 @@ describe("AccountingDocumentOperations.create", () => {
   it("rejects an expired handle with zero mutation", async () => {
     const { path, sha256, api, runtime, ops } = createSetup();
     const handle = await prepareBookingHandle(ops, path);
-    runtime.advanceTime(601_000);
+    runtime.advanceTime(EXECUTION_PLAN_TTL_MS + 1);
     const outcome = await ops.create({ ...baseCreateInput(path, sha256), planHandle: handle });
     expect(outcome.ok).toBe(false);
     if (outcome.ok) return;

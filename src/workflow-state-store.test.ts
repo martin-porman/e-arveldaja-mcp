@@ -235,7 +235,7 @@ describe("workflow state store", () => {
     runtime.advanceTime(10);
     expect(() => runtime.workflowStateStore.inspect(first)).toThrowError(expect.objectContaining({ code: "workflow_state_expired" }));
     expect(runtime.workflowStateStore.activeCount).toBe(0);
-    expect(WORKFLOW_STATE_TTL_MS).toBe(1_800_000);
+    expect(WORKFLOW_STATE_TTL_MS).toBe(1_296_000_000);
     expect(MAX_ACTIVE_WORKFLOW_STATES).toBe(128);
     expect(MAX_WORKFLOW_STATE_TOMBSTONES).toBe(512);
   });

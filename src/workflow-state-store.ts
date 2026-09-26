@@ -3,6 +3,7 @@ import { types as utilTypes } from "node:util";
 import { cloneAndFreezePlanData, type PlanData } from "./plan-store.js";
 import { detailItemFitsSinglePage } from "./response-budget.js";
 import type { RuntimeSafetyScope } from "./runtime-safety-context.js";
+import type { ForkStore, StorePersistence, StoredRecord } from "./crm/persistence.js";
 import type {
   PublicWorkflowRecord,
   PublicWorkflowScalar,
@@ -23,7 +24,17 @@ export type {
 // authority. TTL is sized for a multi-step (multi-turn) workflow rather than a
 // single tool call, but capacity/tombstone bounds and every fail-closed
 // rejection are identical to the operation-result store.
-export const WORKFLOW_STATE_TTL_MS = 1_800_000;
+// 15 days (spec §2.2): outlives the 14-day question-expiry window so a
+// workflow state persisted through the CRM survives at least one full
+// question cycle. CRM_MCP_WORKFLOW_TTL_MS overrides it.
+const DEFAULT_WORKFLOW_STATE_TTL_MS = 1_296_000_000;
+function readTtlMsFromEnv(envVar: string, fallback: number): number {
+  const raw = process.env[envVar];
+  if (raw === undefined || raw.trim() === "") return fallback;
+  const parsed = Number(raw);
+  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : fallback;
+}
+export const WORKFLOW_STATE_TTL_MS = readTtlMsFromEnv("CRM_MCP_WORKFLOW_TTL_MS", DEFAULT_WORKFLOW_STATE_TTL_MS);
 export const MAX_ACTIVE_WORKFLOW_STATES = 128;
 export const MAX_WORKFLOW_STATE_TOMBSTONES = 512;
 const HANDLE_BYTES = 32;
@@ -136,6 +147,12 @@ export interface WorkflowStateStoreOptions {
   readonly ttlMs?: number;
   readonly maxActive?: number;
   readonly maxTombstones?: number;
+  /** Persist every mutation (issue/tombstone/expiry) through the CRM; `initial` rebuilds the maps. */
+  readonly persistence?: {
+    readonly store: ForkStore;
+    readonly sink: StorePersistence;
+    readonly initial: readonly StoredRecord[];
+  };
 }
 
 function invalid(): never { throw new WorkflowStateStoreError("workflow_state_data_invalid"); }
@@ -289,6 +306,7 @@ export class WorkflowStateStore {
   readonly #ttlMs: number;
   readonly #maxActive: number;
   readonly #maxTombstones: number;
+  readonly #persistence?: WorkflowStateStoreOptions["persistence"];
 
   constructor(options: WorkflowStateStoreOptions) {
     this.#getActiveScope = options.getActiveScope;
@@ -297,8 +315,31 @@ export class WorkflowStateStore {
     this.#ttlMs = options.ttlMs ?? WORKFLOW_STATE_TTL_MS;
     this.#maxActive = options.maxActive ?? MAX_ACTIVE_WORKFLOW_STATES;
     this.#maxTombstones = options.maxTombstones ?? MAX_WORKFLOW_STATE_TOMBSTONES;
+    this.#persistence = options.persistence;
     if (!Number.isSafeInteger(this.#ttlMs) || this.#ttlMs <= 0 || !Number.isSafeInteger(this.#maxActive) || this.#maxActive <= 0 ||
       !Number.isSafeInteger(this.#maxTombstones) || this.#maxTombstones <= 0) invalid();
+    if (this.#persistence) {
+      for (const rec of this.#persistence.initial) this.#hydrate(rec);
+    }
+  }
+
+  /** Rebuild one persisted record into the in-process working set (constructor only). */
+  #hydrate(rec: StoredRecord): void {
+    if (rec.state === "active") {
+      try {
+        const stored = cloneAndFreezePlanData(rec.record) as unknown as StoredWorkflowState;
+        this.#active.set(rec.handle, stored);
+      } catch {
+        // Corrupt or incompatible persisted record: drop it rather than fail startup.
+      }
+      return;
+    }
+    this.#tombstones.add(rec.handle);
+  }
+
+  /** Queue one mutation for the CRM without blocking the mutation itself. */
+  #persist(rec: StoredRecord): void {
+    this.#persistence?.sink.save("workflow_states", rec);
   }
 
   get activeCount(): number { this.#purge(this.#readNow()); return this.#active.size; }
@@ -326,6 +367,7 @@ export class WorkflowStateStore {
       const handle = encodeHandle(this.#handleFactory());
       if (this.#active.has(handle) || this.#tombstones.has(handle)) continue;
       this.#active.set(handle, stored);
+      this.#persist({ handle, record: stored, state: "active", expiresAt: new Date(expiresAt).toISOString() });
       return handle;
     }
     throw new WorkflowStateStoreError("workflow_state_handle_collision");
@@ -335,7 +377,7 @@ export class WorkflowStateStore {
     if (!canonicalHandle(handle)) throw new WorkflowStateStoreError("workflow_state_handle_invalid");
     const now = this.#readNow();
     const stored = this.#active.get(handle);
-    if (stored && now >= stored.expiresAt) { this.#expire(handle); this.#addTombstone(handle); }
+    if (stored && now >= stored.expiresAt) { this.#expire(handle); this.#addTombstone(handle, now); }
     this.#purge(now);
     if (!stored || now >= stored.expiresAt) throw new WorkflowStateStoreError(stored || this.#tombstones.has(handle) ? "workflow_state_expired" : "workflow_state_handle_invalid");
     let current: RuntimeSafetyScope;
@@ -346,12 +388,12 @@ export class WorkflowStateStore {
 
   #readNow(): number { const now = this.#now(); if (!Number.isSafeInteger(now) || now < 0) invalid(); return now; }
   #purge(now: number): void {
-    for (const [handle, stored] of this.#active) if (now >= stored.expiresAt) { this.#expire(handle); this.#addTombstone(handle); }
+    for (const [handle, stored] of this.#active) if (now >= stored.expiresAt) { this.#expire(handle); this.#addTombstone(handle, now); }
   }
   #expire(handle: string): void {
     this.#active.delete(handle);
   }
-  #addTombstone(handle: string): void {
+  #addTombstone(handle: string, now: number): void {
     this.#tombstones.delete(handle);
     this.#tombstones.add(handle);
     while (this.#tombstones.size > this.#maxTombstones) {
@@ -359,5 +401,11 @@ export class WorkflowStateStore {
       if (oldest === undefined) break;
       this.#tombstones.delete(oldest);
     }
+    this.#persist({
+      handle,
+      record: { reason: "expired" },
+      state: "tombstone",
+      expiresAt: new Date(now + this.#ttlMs).toISOString(),
+    });
   }
 }

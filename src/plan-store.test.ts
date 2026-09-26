@@ -1,5 +1,5 @@
 import { AsyncLocalStorage } from "node:async_hooks";
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import type { ToolExposureConfig } from "./config.js";
 import type { ConnectionSnapshot } from "./connection-safety.js";
 import {
@@ -11,6 +11,7 @@ import {
 } from "./plan-store.js";
 import { createTestRuntimeSafetyContext } from "./__fixtures__/runtime-safety.js";
 import { createRuntimeSafetyContext, type RuntimeSafetyScope } from "./runtime-safety-context.js";
+import type { StoredRecord, StorePersistence } from "./crm/persistence.js";
 
 function input(overrides: Partial<ExecutionPlanInput> = {}): ExecutionPlanInput {
   return {
@@ -478,5 +479,63 @@ describe("ExecutionPlanStore", () => {
   it("fails closed on an invalid injected clock", () => {
     const runtime = createTestRuntimeSafetyContext({ now: Number.NaN });
     expectCode(() => runtime.planStore.issue("test", input()), "plan_data_invalid");
+  });
+});
+
+describe("CRM persistence (Task 26)", () => {
+  afterEach(() => {
+    delete process.env.CRM_MCP_PLAN_TTL_MS;
+    vi.resetModules();
+  });
+
+  it("EXECUTION_PLAN_TTL_MS defaults to 15 days and honors CRM_MCP_PLAN_TTL_MS", async () => {
+    delete process.env.CRM_MCP_PLAN_TTL_MS;
+    vi.resetModules();
+    const defaults = await import("./plan-store.js");
+    expect(defaults.EXECUTION_PLAN_TTL_MS).toBe(1_296_000_000);
+
+    process.env.CRM_MCP_PLAN_TTL_MS = "42000";
+    vi.resetModules();
+    const overridden = await import("./plan-store.js");
+    expect(overridden.EXECUTION_PLAN_TTL_MS).toBe(42_000);
+  });
+
+  function recordingSink(): StorePersistence & { saved: StoredRecord[] } {
+    const saved: StoredRecord[] = [];
+    return {
+      saved,
+      load: async () => [],
+      save: (_store, rec) => { saved.push(rec); },
+      flush: async () => {},
+    };
+  }
+
+  it("queues a save on issue and a tombstoned save on consume", () => {
+    const sink = recordingSink();
+    const runtime = createTestRuntimeSafetyContext({
+      planStore: { persistence: { store: "plans", sink, initial: [] } },
+    });
+    const handle = runtime.planStore.issue("test", input());
+    expect(sink.saved).toHaveLength(1);
+    expect(sink.saved[0]).toMatchObject({ handle, domain: "test", state: "active" });
+
+    runtime.planStore.consume(handle, "test");
+    const tombstoned = sink.saved.filter(rec => rec.state === "tombstone");
+    expect(tombstoned.length).toBeGreaterThan(0);
+    expect(tombstoned.at(-1)).toMatchObject({ handle, domain: "test", state: "tombstone" });
+  });
+
+  it("queues a tombstoned save on expiry", () => {
+    const sink = recordingSink();
+    const runtime = createTestRuntimeSafetyContext({
+      now: 0,
+      planStore: { persistence: { store: "plans", sink, initial: [] }, ttlMs: 10 },
+    });
+    const handle = runtime.planStore.issue("test", input());
+    runtime.advanceTime(10);
+    expectCode(() => runtime.planStore.inspect(handle, "test"), "plan_handle_expired");
+    const tombstoned = sink.saved.filter(rec => rec.state === "tombstone");
+    expect(tombstoned).toHaveLength(1);
+    expect(tombstoned[0]).toMatchObject({ handle, domain: "test", state: "tombstone" });
   });
 });

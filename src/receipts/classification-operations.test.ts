@@ -10,6 +10,7 @@ import {
   type AccountingWorkflowApiOptions,
 } from "../__fixtures__/accounting-workflow.js";
 import { createTestRuntimeSafetyContext } from "../__fixtures__/runtime-safety.js";
+import { EXECUTION_PLAN_TTL_MS } from "../plan-store.js";
 
 vi.mock("../audit-log.js", () => ({ logAudit: vi.fn() }));
 
@@ -517,7 +518,7 @@ describe("classification operations — P0-2 plan binding", () => {
   it("rejects an expired handle with zero writes", async () => {
     const { operations, api, ctx } = makeSaasOperations();
     const handle = await dryRunHandle(operations, [saasGroup()]);
-    ctx.advanceTime(601_000);
+    ctx.advanceTime(EXECUTION_PLAN_TTL_MS + 1);
     const outcome = await operations.applyClassifications({
       classificationsJson: { groups: [saasGroup()] },
       execute: true,

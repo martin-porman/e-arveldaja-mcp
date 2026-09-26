@@ -3,6 +3,7 @@ import { types as utilTypes } from "node:util";
 import { cloneAndFreezePlanData, type PlanData } from "./plan-store.js";
 import { detailItemFitsSinglePage } from "./response-budget.js";
 import type { RuntimeSafetyScope } from "./runtime-safety-context.js";
+import type { ForkStore, StorePersistence, StoredRecord } from "./crm/persistence.js";
 
 export const OPERATION_RESULT_TTL_MS = 600_000;
 export const MAX_ACTIVE_OPERATION_RESULTS = 128;
@@ -122,6 +123,12 @@ export interface OperationResultStoreOptions {
   readonly maxTombstones?: number;
   readonly assertConsumedPlan: (handle: string, domain: string) => void;
   readonly retainConsumedPlan: (handle: string, domain: string) => () => void;
+  /** Persist every issued result through the CRM; `initial` rebuilds the map. No `state` column server-side (spec 07 l.25). */
+  readonly persistence?: {
+    readonly store: ForkStore;
+    readonly sink: StorePersistence;
+    readonly initial: readonly StoredRecord[];
+  };
 }
 
 function invalid(): never { throw new OperationResultStoreError("operation_result_data_invalid"); }
@@ -278,6 +285,7 @@ export class OperationResultStore {
   readonly #assertConsumedPlan: (handle: string, domain: string) => void;
   readonly #retainConsumedPlan: (handle: string, domain: string) => () => void;
   readonly #planProofReleases = new Map<string, () => void>();
+  readonly #persistence?: OperationResultStoreOptions["persistence"];
 
   constructor(options: OperationResultStoreOptions) {
     this.#getActiveScope = options.getActiveScope;
@@ -288,8 +296,26 @@ export class OperationResultStore {
     this.#maxTombstones = options.maxTombstones ?? MAX_OPERATION_RESULT_TOMBSTONES;
     this.#assertConsumedPlan = options.assertConsumedPlan;
     this.#retainConsumedPlan = options.retainConsumedPlan;
+    this.#persistence = options.persistence;
     if (!Number.isSafeInteger(this.#ttlMs) || this.#ttlMs <= 0 || !Number.isSafeInteger(this.#maxActive) || this.#maxActive <= 0 ||
       !Number.isSafeInteger(this.#maxTombstones) || this.#maxTombstones <= 0) invalid();
+    if (this.#persistence) {
+      for (const rec of this.#persistence.initial) {
+        try {
+          const stored = cloneAndFreezePlanData(rec.record) as unknown as StoredOperationResult;
+          // Re-pin the dependent plan's consumption proof so it stays
+          // verifiable on inspect() after a restart. A plan tombstone that
+          // did not itself survive (or lost its proof) makes this hydrated
+          // result unverifiable — drop it rather than admit a result whose
+          // plan proof can no longer be confirmed.
+          const releasePlanProof = this.#retainConsumedPlan(stored.planHandle, stored.operation);
+          this.#active.set(rec.handle, stored);
+          this.#planProofReleases.set(rec.handle, releasePlanProof);
+        } catch {
+          // Corrupt/incompatible record, or the plan proof no longer holds: drop it.
+        }
+      }
+    }
   }
 
   get activeCount(): number { this.#purge(this.#readNow()); return this.#active.size; }
@@ -322,6 +348,11 @@ export class OperationResultStore {
         if (this.#active.has(handle) || this.#tombstones.has(handle)) continue;
         this.#active.set(handle, stored);
         this.#planProofReleases.set(handle, releasePlanProof);
+        this.#persistence?.sink.save("operation_results", {
+          handle,
+          record: stored,
+          expiresAt: new Date(expiresAt).toISOString(),
+        });
         return handle;
       }
     } catch (error) {

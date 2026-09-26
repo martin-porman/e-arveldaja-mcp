@@ -1,9 +1,19 @@
 import { randomBytes } from "node:crypto";
 import { types as utilTypes } from "node:util";
 import type { RuntimeSafetyScope } from "./runtime-safety-context.js";
+import type { ForkStore, StorePersistence, StoredRecord } from "./crm/persistence.js";
 
 export const EXECUTION_PLAN_SCHEMA = "execution_plan_v1" as const;
-export const EXECUTION_PLAN_TTL_MS = 600_000;
+// 15 days (spec §2.2): outlives the 14-day question-expiry window so a plan
+// persisted through the CRM survives at least one full question cycle.
+const DEFAULT_EXECUTION_PLAN_TTL_MS = 1_296_000_000;
+function readTtlMsFromEnv(envVar: string, fallback: number): number {
+  const raw = process.env[envVar];
+  if (raw === undefined || raw.trim() === "") return fallback;
+  const parsed = Number(raw);
+  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : fallback;
+}
+export const EXECUTION_PLAN_TTL_MS = readTtlMsFromEnv("CRM_MCP_PLAN_TTL_MS", DEFAULT_EXECUTION_PLAN_TTL_MS);
 export const MAX_ACTIVE_EXECUTION_PLANS = 128;
 export const MAX_EXECUTION_PLAN_TOMBSTONES = 512;
 
@@ -92,6 +102,12 @@ export interface ExecutionPlanStoreOptions {
   readonly ttlMs?: number;
   readonly maxActive?: number;
   readonly maxTombstones?: number;
+  /** Persist every mutation (issue/consume/tombstone/expiry) through the CRM; `initial` rebuilds the maps. */
+  readonly persistence?: {
+    readonly store: ForkStore;
+    readonly sink: StorePersistence;
+    readonly initial: readonly StoredRecord[];
+  };
 }
 
 interface Tombstone {
@@ -251,6 +267,7 @@ export class ExecutionPlanStore {
   readonly #ttlMs: number;
   readonly #maxActive: number;
   readonly #maxTombstones: number;
+  readonly #persistence?: ExecutionPlanStoreOptions["persistence"];
 
   constructor(options: ExecutionPlanStoreOptions) {
     this.#getActiveScope = options.getActiveScope;
@@ -259,11 +276,43 @@ export class ExecutionPlanStore {
     this.#ttlMs = options.ttlMs ?? EXECUTION_PLAN_TTL_MS;
     this.#maxActive = options.maxActive ?? MAX_ACTIVE_EXECUTION_PLANS;
     this.#maxTombstones = options.maxTombstones ?? MAX_EXECUTION_PLAN_TOMBSTONES;
+    this.#persistence = options.persistence;
     if (!Number.isSafeInteger(this.#ttlMs) || this.#ttlMs <= 0 ||
       !Number.isSafeInteger(this.#maxActive) || this.#maxActive <= 0 ||
       !Number.isSafeInteger(this.#maxTombstones) || this.#maxTombstones <= 0) {
       throw new PlanStoreError("plan_data_invalid");
     }
+    if (this.#persistence) {
+      for (const rec of this.#persistence.initial) this.#hydrate(rec);
+    }
+  }
+
+  /** Rebuild one persisted record into the in-process working set (constructor only). */
+  #hydrate(rec: StoredRecord): void {
+    if (rec.state === "active") {
+      try {
+        const plan = cloneAndFreezePlanData(rec.record) as unknown as StoredExecutionPlan;
+        this.#active.set(rec.handle, plan);
+      } catch {
+        // Corrupt or incompatible persisted record: drop it rather than fail startup.
+      }
+      return;
+    }
+    // Consumed or tombstoned: restore just enough to keep replay refused and,
+    // when a consumption proof was persisted, to keep dependent operation
+    // results verifiable after a restart.
+    const payload = rec.record && typeof rec.record === "object" ? rec.record as {
+      reason?: "consumed" | "expired";
+      proof?: { domain: string; scope: RuntimeSafetyScope };
+    } : undefined;
+    const reason: Tombstone["reason"] = payload?.reason === "expired" ? "expired" : "consumed";
+    const proof = payload?.proof;
+    this.#tombstones.set(rec.handle, Object.freeze({ reason, pins: 0, ...(proof ? { proof: Object.freeze(proof) } : {}) }));
+  }
+
+  /** Queue one mutation for the CRM without blocking the mutation itself. */
+  #persist(rec: StoredRecord): void {
+    this.#persistence?.sink.save("plans", rec);
   }
 
   get activeCount(): number {
@@ -330,6 +379,7 @@ export class ExecutionPlanStore {
       const handle = encodeHandle(this.#handleFactory());
       if (this.#active.has(handle) || this.#tombstones.has(handle)) continue;
       this.#active.set(handle, plan);
+      this.#persist({ handle, domain: plan.domain, record: plan, state: "active", expiresAt: new Date(plan.expiresAt).toISOString() });
       return handle;
     }
     throw new PlanStoreError("plan_handle_collision");
@@ -343,7 +393,7 @@ export class ExecutionPlanStore {
     if (plan && now >= plan.expiresAt) {
       this.#active.delete(handle);
       this.#purgeExpired(now);
-      this.#addTombstone(handle, "expired");
+      this.#addTombstone(handle, "expired", plan.domain, now);
       throw new PlanStoreError("plan_handle_expired");
     }
     this.#purgeExpired(now);
@@ -371,7 +421,7 @@ export class ExecutionPlanStore {
     // validation, including expiry, operation, connection, and feature drift.
     this.#active.delete(handle);
     this.#purgeExpired(now);
-    this.#addTombstone(handle, now >= plan.expiresAt ? "expired" : "consumed");
+    this.#addTombstone(handle, now >= plan.expiresAt ? "expired" : "consumed", plan.domain, now);
 
     if (now >= plan.expiresAt) throw new PlanStoreError("plan_handle_expired");
     validateDomain(expectedDomain);
@@ -379,7 +429,7 @@ export class ExecutionPlanStore {
     if (!this.#scopeMatches(plan.scope)) {
       throw new PlanStoreError("plan_scope_mismatch");
     }
-    this.#addTombstone(handle, "consumed", { domain: plan.domain, scope: plan.scope });
+    this.#addTombstone(handle, "consumed", plan.domain, now, { domain: plan.domain, scope: plan.scope });
     return plan;
   }
 
@@ -449,16 +499,23 @@ export class ExecutionPlanStore {
     for (const [handle, plan] of this.#active) {
       if (now >= plan.expiresAt) {
         this.#active.delete(handle);
-        this.#addTombstone(handle, "expired");
+        this.#addTombstone(handle, "expired", plan.domain, now);
       }
     }
   }
 
-  #addTombstone(handle: string, reason: Tombstone["reason"], proof?: Tombstone["proof"]): void {
+  #addTombstone(handle: string, reason: Tombstone["reason"], domain: string, now: number, proof?: Tombstone["proof"]): void {
     const pins = this.#tombstones.get(handle)?.pins ?? 0;
     this.#tombstones.delete(handle);
     this.#tombstones.set(handle, Object.freeze({ reason, pins, ...(proof ? { proof: Object.freeze(proof) } : {}) }));
     this.#trimTombstones(proof ? handle : undefined);
+    this.#persist({
+      handle,
+      domain,
+      record: { reason, ...(proof ? { proof } : {}) },
+      state: "tombstone",
+      expiresAt: new Date(now + this.#ttlMs).toISOString(),
+    });
   }
 
   #trimTombstones(protectedHandle?: string): void {

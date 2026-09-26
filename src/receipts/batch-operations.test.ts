@@ -12,6 +12,7 @@ import { summarizeInvoiceExtraction } from "../invoice-extraction-fallback.js";
 import { resolveSupplierInternal } from "../tools/supplier-resolution.js";
 import { HttpError } from "../http-client.js";
 import { createTestRuntimeSafetyContext } from "../__fixtures__/runtime-safety.js";
+import { EXECUTION_PLAN_TTL_MS } from "../plan-store.js";
 import { createReceiptBatchOperations } from "./batch-operations.js";
 import type { ReceiptApprovedManifestEntry } from "./types.js";
 
@@ -572,7 +573,7 @@ describe("receipt batch typed operation — P0-3 plan-handle drift gate", () => 
     const { api, spies } = makeApi();
     const { ops, context } = makeOperationsWithContext(api);
     const { manifest, planHandles } = await dryRunPlan(ops);
-    context.advanceTime(601_000); // > 600_000 ms TTL
+    context.advanceTime(EXECUTION_PLAN_TTL_MS + 1); // past the plan TTL
     const outcome = await ops.runBatch({
       ...baseRun, executionMode: "create", dryRun: false, approvedManifest: manifest, planHandle: planHandles.create,
     });
