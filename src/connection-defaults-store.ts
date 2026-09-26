@@ -117,7 +117,7 @@ function isStoredBankDefault(value: unknown): value is StoredBankDefault {
   return (
     e.kind === "bank_default" &&
     isNonEmptyString(e.connectionId) &&
-    (e.environmentKind === "live" || e.environmentKind === "demo" || e.environmentKind === "setup") &&
+    (e.environmentKind === "live" || e.environmentKind === "demo" || e.environmentKind === "crm" || e.environmentKind === "setup") &&
     Number.isInteger(e.accounts_dimensions_id) &&
     Number.isInteger(e.ledgerAccountId) &&
     isNonEmptyString(e.currency)

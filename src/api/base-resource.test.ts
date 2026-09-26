@@ -748,6 +748,9 @@ describe("BaseResource", () => {
     it("M01 evicts only the affected namespace resource caches after a raw network update", async () => {
       const client = makeClient();
       const resource = new ClientsApi(client);
+      // ClientsApi.update resolves the RIK numeric id to a CRM counterparty id
+      // through POST /id-map before it ever reaches PATCH /counterparties/:id.
+      vi.mocked(client.post).mockResolvedValue({ crmIds: ["5"] });
       cache.set("connection:0:/clients:list:page=1", "client-list");
       cache.set("connection:0:/clients:listAll", "all-clients");
       cache.set("connection:0:/clients:5", "client-five");
@@ -757,7 +760,7 @@ describe("BaseResource", () => {
         "request failed after retries",
         "network",
         "PATCH",
-        "/clients/5",
+        "/counterparties/5",
       );
       vi.mocked(client.patch).mockRejectedValueOnce(networkError);
 
@@ -777,7 +780,7 @@ describe("BaseResource", () => {
           message: "request failed after retries",
           status: "network",
           method: "PATCH",
-          path: "/clients/5",
+          path: "/counterparties/5",
         },
       });
       expect(cache.get("connection:0:/clients:list:page=1")).toBeUndefined();
@@ -787,6 +790,10 @@ describe("BaseResource", () => {
       expect(cache.get("connection:1:/clients:list:")).toBe("other-company-clients");
     });
 
+    // ClientsApi.delete no longer performs a network mutation at all (it is
+    // approval-only, spec §2.3) — it cannot be "ambiguous", so it is covered
+    // by its own test below instead of this shared inherited-network-mutation
+    // parametrization.
     const inheritedCases = [
       {
         label: "create",
@@ -794,7 +801,7 @@ describe("BaseResource", () => {
         entityId: undefined,
         businessKey: "/clients:create",
         method: "POST",
-        path: "/clients",
+        path: "/counterparties",
         invoke: (resource: ClientsApi) => resource.create({ name: "new" }),
         requestMock: (client: HttpClient) => client.post,
       },
@@ -804,19 +811,12 @@ describe("BaseResource", () => {
         entityId: 5,
         businessKey: "/clients:5",
         method: "PATCH",
-        path: "/clients/5",
+        path: "/counterparties/5",
         invoke: (resource: ClientsApi) => resource.update(5, { name: "updated" }),
         requestMock: (client: HttpClient) => client.patch,
-      },
-      {
-        label: "delete",
-        operation: "delete",
-        entityId: 5,
-        businessKey: "/clients:5",
-        method: "DELETE",
-        path: "/clients/5",
-        invoke: (resource: ClientsApi) => resource.delete(5),
-        requestMock: (client: HttpClient) => client.delete,
+        // update() resolves the numeric id to a CRM counterparty id via
+        // POST /id-map before it PATCHes /counterparties/:id.
+        setup: (client: HttpClient) => { vi.mocked(client.post).mockResolvedValue({ crmIds: ["5"] }); },
       },
       {
         label: "upload document",
@@ -845,6 +845,7 @@ describe("BaseResource", () => {
       const resource = new ClientsApi(client);
       cache.set("connection:0:/clients:list:", "clients");
       cache.set("connection:0:/products:list:", "products");
+      if ("setup" in row) row.setup(client);
       const networkError = new HttpError("ambiguous transport", "network", row.method, row.path);
       vi.mocked(row.requestMock(client)).mockRejectedValueOnce(networkError);
 
@@ -872,14 +873,30 @@ describe("BaseResource", () => {
       expect(cache.get("connection:0:/products:list:")).toBe("products");
     });
 
+    it("M01 ClientsApi.delete refuses immediately as approval-only — it never reaches the network layer", async () => {
+      const client = makeClient();
+      const resource = new ClientsApi(client);
+
+      const thrown = await resource.delete(5).catch(error => error);
+
+      expect(thrown).toBeInstanceOf(HttpError);
+      expect(thrown).toMatchObject({
+        status: 501,
+        message: "approval-only: deleting a counterparty goes through an approval card",
+      });
+      expect(client.delete).not.toHaveBeenCalled();
+      expect(client.post).not.toHaveBeenCalled();
+    });
+
     it.each([
-      ["400", new HttpError("bad request", 400, "PATCH", "/clients/5")],
-      ["409", new HttpError("conflict", 409, "PATCH", "/clients/5")],
-      ["503", new HttpError("unavailable", 503, "PATCH", "/clients/5")],
+      ["400", new HttpError("bad request", 400, "PATCH", "/counterparties/5")],
+      ["409", new HttpError("conflict", 409, "PATCH", "/counterparties/5")],
+      ["503", new HttpError("unavailable", 503, "PATCH", "/counterparties/5")],
       ["ordinary", new Error("ordinary failure")],
     ] as const)("M01 preserves a definite %s failure without cache eviction", async (_label, failure) => {
       const client = makeClient();
       const resource = new ClientsApi(client);
+      vi.mocked(client.post).mockResolvedValue({ crmIds: ["5"] });
       cache.set("connection:0:/clients:list:", "clients");
       const generation = cache.generation;
       vi.mocked(client.patch).mockRejectedValueOnce(failure);
@@ -894,6 +911,7 @@ describe("BaseResource", () => {
     it("M01 rethrows structured ambiguity by identity and invalidates the deduplicated cache union", async () => {
       const client = makeClient();
       const resource = new ClientsApi(client);
+      vi.mocked(client.post).mockResolvedValue({ crmIds: ["5"] });
       cache.set("connection:0:/clients:list:", "clients");
       cache.set("connection:0:/products:list:", "products");
       cache.set("connection:0:/journals:list:", "journals");
@@ -903,7 +921,7 @@ describe("BaseResource", () => {
         entityId: 5,
         businessKey: "external-client-key",
         affectedCaches: ["/clients", "/products", "/products"],
-        cause: new HttpError("socket closed", "network", "PATCH", "/clients/5"),
+        cause: new HttpError("socket closed", "network", "PATCH", "/counterparties/5"),
         nextAction: "Use the original recovery action.",
       });
       const originalFields = {
@@ -930,6 +948,7 @@ describe("BaseResource", () => {
     it("M01 ignores empty unknown and noncanonical declared cache prefixes", async () => {
       const client = makeClient();
       const resource = new ClientsApi(client);
+      vi.mocked(client.post).mockResolvedValue({ crmIds: ["5"] });
       cache.set("connection:0:/clients:list:", "clients");
       cache.set("connection:0:/products:list:", "products");
       cache.set("connection:0:/journals:list:", "journals");
@@ -969,6 +988,7 @@ describe("BaseResource", () => {
     it("M01 invalidates the mandatory local prefix when affectedCaches access throws", async () => {
       const client = makeClient();
       const resource = new ClientsApi(client);
+      vi.mocked(client.post).mockResolvedValue({ crmIds: ["5"] });
       cache.set("connection:0:/clients:list:", "clients");
       cache.set("connection:0:/products:list:", "products");
       const structural = {
@@ -995,9 +1015,11 @@ describe("BaseResource", () => {
       expect(cache.get("connection:0:/products:list:")).toBe("products");
     });
 
+    // ProductsApi is excluded here: its update() is switched off (spec §2.3,
+    // "the catalogue is maintained in the CRM") and never reaches the network
+    // layer at all, so it cannot be "ambiguous" — covered by its own test below.
     it.each([
       [ClientsApi, "/clients", "client"],
-      [ProductsApi, "/products", "product"],
       [JournalsApi, "/journals", "journal"],
       [TransactionsApi, "/transactions", "transaction"],
       [SaleInvoicesApi, "/sale_invoices", "sale_invoice"],
@@ -1005,6 +1027,9 @@ describe("BaseResource", () => {
     ] as const)("M01 maps inherited ambiguity for %s to singular %s metadata", async (Api, path, entity) => {
       const client = makeClient();
       const resource = new Api(client);
+      // ClientsApi.update resolves the numeric id to a CRM counterparty id via
+      // POST /id-map before it PATCHes /counterparties/:id.
+      if ((Api as unknown) === ClientsApi) vi.mocked(client.post).mockResolvedValue({ crmIds: ["5"] });
       vi.mocked(client.patch).mockRejectedValueOnce(
         new HttpError("network ambiguity", "network", "PATCH", `${path}/5`),
       );
@@ -1019,6 +1044,20 @@ describe("BaseResource", () => {
         businessKey: `${path}:5`,
         affectedCaches: [path],
       });
+    });
+
+    it("M01 ProductsApi writes are switched off, not network-ambiguous — every write refuses immediately with a 501", async () => {
+      const client = makeClient();
+      const resource = new ProductsApi(client);
+
+      await expect(resource.create({ name: "x" })).rejects.toThrow(/switched off/);
+      await expect(resource.update(5, { name: "x" })).rejects.toThrow(/switched off/);
+      await expect(resource.delete(5)).rejects.toThrow(/switched off/);
+      await expect(resource.deactivate(5)).rejects.toThrow(/switched off/);
+      await expect(resource.restore(5)).rejects.toThrow(/switched off/);
+      expect(client.post).not.toHaveBeenCalled();
+      expect(client.patch).not.toHaveBeenCalled();
+      expect(client.delete).not.toHaveBeenCalled();
     });
   });
 });

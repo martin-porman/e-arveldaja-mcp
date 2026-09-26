@@ -60,6 +60,20 @@ describe("connection-defaults-store — persistence + read", () => {
     expect(store.readBankDefault({ ...scope, expectedLedgerAccountId: 1020 })).toBeUndefined();
   });
 
+  it("round-trips a saved bank default under the crm environment kind", () => {
+    const path = tempStorePath();
+    const store = createConnectionDefaultsStore(path);
+    const crmScope = { connectionId: "conn-A", environmentKind: "crm" as const };
+    store.saveBankDefault({ ...crmScope, accounts_dimensions_id: 102, ledgerAccountId: 1020, currency: "EUR" });
+    const pointer = store.readBankDefault({ ...crmScope, expectedLedgerAccountId: 1020 });
+    expect(pointer).toMatchObject({
+      accounts_dimensions_id: 102,
+      connectionId: "conn-A",
+      ledgerAccountId: 1020,
+      currency: "EUR",
+    });
+  });
+
   it("upserts (replaces) an existing bank default for the same key", () => {
     const path = tempStorePath();
     const store = createConnectionDefaultsStore(path);

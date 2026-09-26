@@ -1,10 +1,12 @@
-import type { HttpClient } from "../http-client.js";
+import { HttpError, type HttpClient, type HttpMethod } from "../http-client.js";
 import type {
   Account, AccountDimension, Currency, SaleArticle, PurchaseArticle,
   Template, CompanyInvoiceInfo, CompanyVatInfo, Project, InvoiceSeries,
-  BankAccount, ApiResponse, PaginatedResponse
+  BankAccount, ApiResponse
 } from "../types/api.js";
 import { Cache } from "../cache.js";
+import { IdMap } from "../crm/id-map.js";
+import { toRikAccount, type CrmAccount } from "../crm/mappers.js";
 
 const REFERENCE_TTL_SECONDS = 600; // 10 min cache for reference data
 
@@ -14,68 +16,63 @@ function readonlyCacheKey(client: HttpClient, key: string): string {
   return `${client.cacheNamespace}:${key}`;
 }
 
-function invalidateReadonlyCache(client: HttpClient, pattern: string): void {
-  readonlyCache.invalidate(readonlyCacheKey(client, pattern));
-}
-
-async function readonlyCachedGet<T>(client: HttpClient, path: string): Promise<T> {
-  const cacheKey = readonlyCacheKey(client, path);
-  const readonlyCached = readonlyCache.get<T>(cacheKey);
-  if (readonlyCached !== undefined) return readonlyCached;
-  // Capture generation BEFORE the network round-trip. If a mutator invalidates
-  // the cache while this request is in flight, the generation bumps and
-  // setIfSameGeneration will discard the now-stale result instead of polluting
-  // the cache for ~10 minutes.
+/** One GET, cached; `compute` does the CRM fetch + RIK mapping. */
+async function cachedCompute<T>(client: HttpClient, key: string, compute: () => Promise<T>): Promise<T> {
+  const cacheKey = readonlyCacheKey(client, key);
+  const cached = readonlyCache.get<T>(cacheKey);
+  if (cached !== undefined) return cached;
+  // Capture generation BEFORE the round-trip so a concurrent invalidation
+  // can't have a slow in-flight read pollute the cache afterwards.
   const gen = readonlyCache.generation;
-  const result = await client.get<T>(path);
+  const result = await compute();
   readonlyCache.setIfSameGeneration(cacheKey, result, gen, REFERENCE_TTL_SECONDS);
   return result;
 }
 
-async function readonlyCachedGetAll<T>(client: HttpClient, path: string): Promise<T[]> {
-  const cacheKey = readonlyCacheKey(client, `${path}:all`);
-  const readonlyCached = readonlyCache.get<T[]>(cacheKey);
-  if (readonlyCached !== undefined) return readonlyCached;
-
-  const gen = readonlyCache.generation;
-
-  // First request - detect if paginated or plain array
-  const first = await client.get<T[] | PaginatedResponse<T>>(path);
-
-  let allItems: T[];
-
-  if (Array.isArray(first)) {
-    // Plain array response (accounts, currencies, templates, etc.)
-    allItems = first;
-  } else if (first && typeof first === "object" && "items" in first) {
-    // Paginated response
-    allItems = [...first.items];
-    let page = 2;
-    const maxPages = 200;
-    let totalPages = first.total_pages;
-    while (page <= totalPages) {
-      if (page > maxPages) {
-        throw new Error(`Reference data ${path} exceeds ${maxPages} pages (${allItems.length} items loaded).`);
-      }
-      const next = await client.get<PaginatedResponse<T>>(path, { page });
-      allItems.push(...(next.items ?? []));
-      totalPages = next.total_pages;
-      page++;
-    }
-  } else {
-    throw new Error(`Unexpected response shape from ${path}`);
-  }
-
-  readonlyCache.setIfSameGeneration(cacheKey, allItems, gen, REFERENCE_TTL_SECONDS);
-  return allItems;
+function switchedOff(method: HttpMethod, path: string, reason: string): never {
+  throw new HttpError(`switched off in the CRM-MCP: ${reason}`, 501, method, path);
 }
 
+type CrmCompanyProfile = {
+  name: string;
+  regCode: string;
+  vatNo: string | null;
+  vatLiable: boolean | null;
+  financialYearPeriod: string | null;
+  fiscalYears: { startDate: string; endDate: string }[];
+};
+
+type CrmBankAccountRow = { iban: string; accountCode: string; name: string; currency: string; isActive: boolean };
+type CrmDimensionRow = { id: string; axis: string; code: string; name: string; isActive: boolean };
+type CrmNumberSeriesRow = { id: string; key: string; year: number; prefix: string; width: number; lastNumber: number };
+
+// A CRM bank account IS the sub-ledger dimension it books through: the same
+// numeric id serves as both `BankAccount.id`/`accounts_dimensions_id` and
+// `AccountDimension.id`, and the dimension's `accounts_id` is the bank
+// account's own ledger account. This keeps `resolveBankAccount` (spec
+// bank-account-resolution.ts) working over the CRM without a CRM concept of
+// "account dimension" that doesn't exist.
+type BankAccountJoin = { row: CrmBankAccountRow; id: number; ledgerAccountId: number };
+
 export class ReferenceDataApi {
-  constructor(private client: HttpClient) {}
+  private readonly idMap: IdMap;
+
+  constructor(private client: HttpClient) {
+    this.idMap = new IdMap(client);
+  }
+
+  private async loadAccounts(): Promise<{ row: CrmAccount; id: number }[]> {
+    return cachedCompute(this.client, "/accounts:all", async () => {
+      const rows = await this.client.get<CrmAccount[]>("/accounts");
+      const ids = await this.idMap.toNumeric("account", rows.map(r => r.code));
+      return rows.map((row, i) => ({ row, id: ids[i]! }));
+    });
+  }
 
   // Chart of accounts
   async getAccounts(): Promise<Account[]> {
-    return readonlyCachedGetAll<Account>(this.client, "/accounts");
+    const joined = await this.loadAccounts();
+    return joined.map(({ row, id }) => toRikAccount(row, id));
   }
 
   async getAccount(id: number): Promise<Account | undefined> {
@@ -83,103 +80,174 @@ export class ReferenceDataApi {
     return accounts.find(a => a.id === id);
   }
 
-  // Account dimensions
+  private async loadBankAccounts(): Promise<BankAccountJoin[]> {
+    return cachedCompute(this.client, "/bank-accounts:all", async () => {
+      const rows = await this.client.get<CrmBankAccountRow[]>("/bank-accounts");
+      const ids = await this.idMap.toNumeric("bank_account", rows.map(r => r.iban));
+      const ledgerIds = await this.idMap.toNumeric("account", rows.map(r => r.accountCode));
+      return rows.map((row, i) => ({ row, id: ids[i]!, ledgerAccountId: ledgerIds[i]! }));
+    });
+  }
+
+  // Account dimensions — derived from bank accounts (see BankAccountJoin above).
   async getAccountDimensions(): Promise<AccountDimension[]> {
-    return readonlyCachedGetAll<AccountDimension>(this.client, "/account_dimensions");
+    const joined = await this.loadBankAccounts();
+    return joined.map(({ row, id, ledgerAccountId }) => ({
+      id,
+      accounts_id: ledgerAccountId,
+      title_est: row.name,
+      cl_currencies_id: row.currency,
+      is_deleted: !row.isActive,
+    }));
   }
 
-  // Currencies
+  // Currencies — the core is euro-cents only (crm/src/lib/accounting/types.ts:15).
   async getCurrencies(): Promise<Currency[]> {
-    return readonlyCachedGetAll<Currency>(this.client, "/currencies");
+    return [{ id: "EUR", name_est: "Euro", name_eng: "Euro" }];
   }
 
-  // Sale articles
+  // Sale/purchase articles have no dedicated CRM catalogue: receipt-batch
+  // (receipts/batch-operations.ts:695-709) and purchase-vat-defaults.ts:140
+  // both depend on getPurchaseArticles() succeeding, so it is derived from
+  // the chart instead of switched off — every active, non-heading EXPENSE
+  // account is a purchase article (mirror for REVENUE / sale articles), the
+  // article's own `accounts_id` being that same account.
   async getSaleArticles(): Promise<SaleArticle[]> {
-    return readonlyCachedGetAll<SaleArticle>(this.client, "/sale_articles");
+    const joined = await this.loadAccounts();
+    return joined
+      .filter(({ row }) => row.type === "REVENUE" && row.isActive && !row.isHeading)
+      .map(({ row, id }) => ({
+        id,
+        group_est: row.nameEt,
+        group_eng: row.nameEn ?? row.nameEt,
+        name_est: row.nameEt,
+        name_eng: row.nameEn ?? row.nameEt,
+        accounts_id: id,
+        vat_type: 0,
+        is_valid: true,
+        cl_account_groups: row.roles,
+      }));
   }
 
-  // Purchase articles
   async getPurchaseArticles(): Promise<PurchaseArticle[]> {
-    return readonlyCachedGetAll<PurchaseArticle>(this.client, "/purchase_articles");
+    const joined = await this.loadAccounts();
+    return joined
+      .filter(({ row }) => row.type === "EXPENSE" && row.isActive && !row.isHeading)
+      .map(({ row, id }) => ({
+        id,
+        level: 1,
+        name_est: row.nameEt,
+        name_eng: row.nameEn ?? row.nameEt,
+        accounts_id: id,
+        cl_account_groups: row.roles,
+        is_disabled: false,
+      }));
   }
 
   // Templates
   async getTemplates(): Promise<Template[]> {
-    return readonlyCachedGetAll<Template>(this.client, "/templates");
+    return switchedOff("GET", "/templates", "invoice templates are not exposed by the CRM-MCP");
+  }
+
+  private async companyProfile(): Promise<CrmCompanyProfile> {
+    return cachedCompute(this.client, "/company-profile", () =>
+      this.client.get<CrmCompanyProfile>("/company-profile"));
   }
 
   // Invoice info
   async getInvoiceInfo(): Promise<CompanyInvoiceInfo> {
-    return readonlyCachedGet<CompanyInvoiceInfo>(this.client, "/invoice_info");
+    const profile = await this.companyProfile();
+    return { invoice_company_name: profile.name };
   }
 
-  async updateInvoiceInfo(data: Partial<CompanyInvoiceInfo>): Promise<ApiResponse> {
-    const result = await this.client.patch<ApiResponse>("/invoice_info", data);
-    invalidateReadonlyCache(this.client, "/invoice_info");
-    return result;
+  async updateInvoiceInfo(_data: Partial<CompanyInvoiceInfo>): Promise<ApiResponse> {
+    return switchedOff("PATCH", "/invoice_info", "company profile is read-only in the CRM-MCP");
   }
 
   // VAT info
   async getVatInfo(): Promise<CompanyVatInfo> {
-    return readonlyCachedGet<CompanyVatInfo>(this.client, "/vat_info");
+    const profile = await this.companyProfile();
+    return { vat_number: profile.vatNo ?? undefined };
   }
 
-  // Projects (read-only list)
+  // Projects — the CRM's general-purpose dimensions filtered to the PROJECT axis.
   async getProjects(): Promise<Project[]> {
-    return readonlyCachedGetAll<Project>(this.client, "/projects");
+    return cachedCompute(this.client, "/dimensions:projects", async () => {
+      const rows = await this.client.get<CrmDimensionRow[]>("/dimensions");
+      const projectRows = rows.filter(r => r.axis === "PROJECT");
+      const ids = await this.idMap.toNumeric("dimension", projectRows.map(r => r.id));
+      return projectRows.map((r, i) => ({
+        id: ids[i]!,
+        name: r.name,
+        cl_projects_type: r.axis,
+        is_disabled: !r.isActive,
+      }));
+    });
   }
 
-  // Invoice series
+  // Invoice series — the CRM's number series (per-kind/year document numbering).
   async getInvoiceSeries(): Promise<InvoiceSeries[]> {
-    return readonlyCachedGetAll<InvoiceSeries>(this.client, "/invoice_series");
+    return cachedCompute(this.client, "/number-series:all", async () => {
+      const rows = await this.client.get<CrmNumberSeriesRow[]>("/number-series");
+      const ids = await this.idMap.toNumeric("series", rows.map(r => r.id));
+      return rows.map((r, i) => ({
+        id: ids[i]!,
+        is_active: true,
+        is_default: false,
+        number_prefix: r.prefix,
+        number_start_value: r.lastNumber + 1,
+        term_days: 0,
+      }));
+    });
   }
 
   async getInvoiceSeriesOne(id: number): Promise<InvoiceSeries> {
-    return this.client.get<InvoiceSeries>(`/invoice_series/${id}`);
+    const all = await this.getInvoiceSeries();
+    const found = all.find(s => s.id === id);
+    if (!found) throw new HttpError(`CRM 404 on GET /number-series/${id}`, 404, "GET", `/number-series/${id}`);
+    return found;
   }
 
-  async createInvoiceSeries(data: Partial<InvoiceSeries>): Promise<ApiResponse> {
-    const result = await this.client.post<ApiResponse>("/invoice_series", data);
-    invalidateReadonlyCache(this.client, "/invoice_series");
-    return result;
+  async createInvoiceSeries(_data: Partial<InvoiceSeries>): Promise<ApiResponse> {
+    return switchedOff("POST", "/invoice_series", "the series are decided, R2 Task 17");
   }
 
-  async updateInvoiceSeries(id: number, data: Partial<InvoiceSeries>): Promise<ApiResponse> {
-    const result = await this.client.patch<ApiResponse>(`/invoice_series/${id}`, data);
-    invalidateReadonlyCache(this.client, "/invoice_series");
-    return result;
+  async updateInvoiceSeries(_id: number, _data: Partial<InvoiceSeries>): Promise<ApiResponse> {
+    return switchedOff("PATCH", "/invoice_series", "the series are decided, R2 Task 17");
   }
 
-  async deleteInvoiceSeries(id: number): Promise<ApiResponse> {
-    const result = await this.client.delete<ApiResponse>(`/invoice_series/${id}`);
-    invalidateReadonlyCache(this.client, "/invoice_series");
-    return result;
+  async deleteInvoiceSeries(_id: number): Promise<ApiResponse> {
+    return switchedOff("DELETE", "/invoice_series", "the series are decided, R2 Task 17");
   }
 
   // Bank accounts
   async getBankAccounts(): Promise<BankAccount[]> {
-    return readonlyCachedGetAll<BankAccount>(this.client, "/bank_accounts");
+    const joined = await this.loadBankAccounts();
+    return joined.map(({ row, id }) => ({
+      id,
+      account_name_est: row.name,
+      account_no: row.iban,
+      iban_code: row.iban,
+      accounts_dimensions_id: id,
+    }));
   }
 
   async getBankAccount(id: number): Promise<BankAccount> {
-    return this.client.get<BankAccount>(`/bank_accounts/${id}`);
+    const all = await this.getBankAccounts();
+    const found = all.find(b => b.id === id);
+    if (!found) throw new HttpError(`CRM 404 on GET /bank-accounts/${id}`, 404, "GET", `/bank-accounts/${id}`);
+    return found;
   }
 
-  async createBankAccount(data: Partial<BankAccount>): Promise<ApiResponse> {
-    const result = await this.client.post<ApiResponse>("/bank_accounts", data);
-    invalidateReadonlyCache(this.client, "/bank_accounts");
-    return result;
+  async createBankAccount(_data: Partial<BankAccount>): Promise<ApiResponse> {
+    return switchedOff("POST", "/bank_accounts", "bank accounts are an operator fact, V11");
   }
 
-  async updateBankAccount(id: number, data: Partial<BankAccount>): Promise<ApiResponse> {
-    const result = await this.client.patch<ApiResponse>(`/bank_accounts/${id}`, data);
-    invalidateReadonlyCache(this.client, "/bank_accounts");
-    return result;
+  async updateBankAccount(_id: number, _data: Partial<BankAccount>): Promise<ApiResponse> {
+    return switchedOff("PATCH", "/bank_accounts", "bank accounts are an operator fact, V11");
   }
 
-  async deleteBankAccount(id: number): Promise<ApiResponse> {
-    const result = await this.client.delete<ApiResponse>(`/bank_accounts/${id}`);
-    invalidateReadonlyCache(this.client, "/bank_accounts");
-    return result;
+  async deleteBankAccount(_id: number): Promise<ApiResponse> {
+    return switchedOff("DELETE", "/bank_accounts", "bank accounts are an operator fact, V11");
   }
 }

@@ -141,7 +141,12 @@ describe("PublicToolRegistrar", () => {
       name: "company-scope",
       config: { apiKeyId: "id", apiPublicValue: "public", apiPassword: "password", baseUrl: "https://demo-rmp-api.rik.ee/v1" },
     };
-    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({ invoice_company_name: "Live Company OÜ" }), {
+    // readonly.getInvoiceInfo() is CRM-backed (spec §2.3, R4a Task 23): it
+    // reads GET /company-profile and maps `.name` onto `invoice_company_name`,
+    // not the RIK /invoice_info route.
+    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({
+      name: "Live Company OÜ", regCode: "12345678", vatNo: null, vatLiable: null, financialYearPeriod: null, fiscalYears: [],
+    }), {
       status: 200,
       headers: { "content-type": "application/json" },
     }));
@@ -154,7 +159,7 @@ describe("PublicToolRegistrar", () => {
       const response = await client.callTool({ name: "list_connections", arguments: {} });
       expect(response.isError).not.toBe(true);
       expect(fetchMock).toHaveBeenCalledTimes(1);
-      expect(String(fetchMock.mock.calls[0]![0])).toContain("/invoice_info");
+      expect(String(fetchMock.mock.calls[0]![0])).toContain("/company-profile");
     } finally {
       await Promise.allSettled([client.close(), bootstrap.server.close()]);
       vi.unstubAllGlobals();
