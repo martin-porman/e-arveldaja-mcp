@@ -663,6 +663,12 @@ class ClassificationOperationsImpl implements ClassificationOperations {
               liability_accounts_id: resolved.suggestion.liability_account_id ?? DEFAULT_LIABILITY_ACCOUNT,
               notes: tagNotes(`Auto-created from classified bank transaction ${transaction.id}`),
               items: [purchaseItem],
+              // The source is the bank transaction, not a file (plan R4a Task 25):
+              // `createAndSetTotals` resolves this RIK id to the CRM's own id via the
+              // id map, so re-classifying the same transaction upserts the same
+              // draft document (sourceKeyFor's `bankline:` prefix) instead of
+              // duplicating it.
+              crm_source: { bank_transaction_id: transaction.id },
             },
             deriveAutoBookedVatPrice(grossAmount, vatConfig),
             grossAmount,

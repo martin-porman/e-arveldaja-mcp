@@ -219,6 +219,10 @@ export async function createAndMaybeMatchPurchaseInvoice(
         bank_account_no: extracted.supplier_iban,
         notes: tagNotes(invoiceNotes),
         items: [item],
+        // The batch's own per-file digest (prepareReceiptBatchSnapshot,
+        // receipt-inbox-files.ts:390 — the same hash the approved manifest is
+        // built from), not re-hashed here (plan R4a Task 25).
+        crm_source: { sha256: snapshot.sha256 },
       },
       extracted.total_vat,
       extracted.total_gross,

@@ -208,6 +208,7 @@ Before creating anything, present one approval card:
 - Net / VAT / gross amounts
 - Currency, `currency_rate`, and any `base_gross_price` / other `base_*` EUR totals for non-EUR invoices
 - The exact item-level booking you intend to send, including article IDs, account IDs, `purchase_accounts_dimensions_id`, VAT fields, `vat_accounts_dimensions_id`, and any `reversed_vat_id`
+- For a reverse charge from another EU state, or a 0 % / exempt line, set `crm_vat_code` to the core code and state why
 - Any `tax_notes` returned by `suggest_booking` (title + statutory basis), with how you applied each one
 - The booking basis used and any assumptions, including whether it came from this supplier's history (`suggest_booking`) or supplier-independent reference-data defaults for a new supplier
 - Validation evidence, so the operator can judge extraction quality before any mutation:

@@ -4,6 +4,7 @@ import { Cache } from "../cache.js";
 import { log } from "../logger.js";
 import { reportProgress } from "../progress.js";
 import type { AuditEntityType } from "../audit-log.js";
+import { IdMap } from "../crm/id-map.js";
 import {
   isMutationIndeterminate,
   MutationIndeterminateError,
@@ -11,6 +12,44 @@ import {
 } from "../mutation-outcome.js";
 
 export const cache = new Cache(300);
+
+/** A CRM `Document` row (crm/src/lib/crm-mcp/reads.ts `documentRow`), shared by every
+ * document-backed `BaseResource<T>` subclass (spec R4a Task 25). */
+export type CrmDocumentLine = {
+  description: string;
+  quantity: string | null;
+  unitPrice: string | null;
+  net: string;
+  side: "D" | "C" | null;
+  vatCode: string | null;
+  vatAmount: string;
+  accountCode: string;
+  dimensionId: string | null;
+};
+
+export type CrmDocument = {
+  id: string;
+  kind: string;
+  status: "DRAFT" | "POSTED" | "REVERSED";
+  number: string;
+  counterpartyId: string | null;
+  docDate: string;
+  turnoverDate: string;
+  dueDate: string | null;
+  description: string;
+  sourceKey: string | null;
+  creditsDocumentId: string | null;
+  lines: CrmDocumentLine[];
+};
+
+/** Opt-in for a `BaseResource<T>` whose records are CRM `Document` rows of one or more
+ * `kind`s (spec R4a Task 25). Unset, every method below is the original RIK-shaped
+ * `${basePath}` behaviour — this is a per-resource routing parameter, not a backend
+ * toggle: `PurchaseInvoicesApi` deliberately does not opt in (its `get`/`update` stay
+ * on `/purchase_invoices` for `previewTotalsCorrection`, which stays adapter-internal). */
+export interface DocumentBackedOptions {
+  readonly kinds: readonly string[];
+}
 
 const MUTATION_ENTITY_BY_PATH = {
   "/clients": "client",
@@ -109,10 +148,22 @@ function validatePage<T>(response: unknown, requestedPage: number): PaginatedRes
 }
 
 export class BaseResource<T> {
+  protected readonly documentIdMap?: IdMap;
+
   constructor(
     protected client: HttpClient,
     protected basePath: string,
-  ) {}
+    protected readonly documents?: DocumentBackedOptions,
+  ) {
+    if (documents) this.documentIdMap = new IdMap(client);
+  }
+
+  /** Maps a CRM document row (plus its id-mapped numeric id and counterparty id) onto
+   * `T`. Required when `documents` is set; the base throws so a missing override fails
+   * loudly instead of silently returning garbage. */
+  protected fromDocument(_doc: CrmDocument, _id: number, _clientsId: number | null): T {
+    throw new Error(`${this.basePath}: fromDocument must be overridden by a document-backed resource`);
+  }
 
   get connectionFingerprint(): string {
     return this.client.connectionFingerprint;
@@ -193,6 +244,7 @@ export class BaseResource<T> {
   }
 
   async list(params?: ListParams): Promise<PaginatedResponse<T>> {
+    if (this.documents) return this.listDocumentBacked(params);
     const requestedPage = params?.page ?? 1;
     validateRequestedPage(requestedPage);
     const sortedParams = params ? Object.keys(params).sort().map(k => `${k}=${(params as Record<string, unknown>)[k]}`).join("&") : "";
@@ -221,6 +273,67 @@ export class BaseResource<T> {
       }
       throw error;
     }
+  }
+
+  private static readonly DOCUMENT_LIST_PAGE_SIZE = 100;
+
+  /**
+   * `list()` for a document-backed resource (`documents` set): every `kind` is walked
+   * separately — the CRM's `GET /documents` `kind` filter takes one value (spec R4a
+   * Task 25) — then paginated client-side with this resource's own page size, the same
+   * simplification `TransactionsApi.list` already makes (transactions.api.ts:156-162).
+   * Status/date filters are not forwarded; callers filter the returned page themselves.
+   */
+  private async listDocumentBacked(params?: ListParams): Promise<PaginatedResponse<T>> {
+    const requestedPage = params?.page ?? 1;
+    validateRequestedPage(requestedPage);
+    const all = await this.loadAllDocumentBacked();
+    const total_pages = Math.max(1, Math.ceil(all.length / BaseResource.DOCUMENT_LIST_PAGE_SIZE));
+    const items = all.slice(
+      (requestedPage - 1) * BaseResource.DOCUMENT_LIST_PAGE_SIZE,
+      requestedPage * BaseResource.DOCUMENT_LIST_PAGE_SIZE,
+    );
+    return { current_page: requestedPage, total_pages, items };
+  }
+
+  private async loadAllDocumentBacked(): Promise<T[]> {
+    const cacheKey = this.cacheKey(`${this.basePath}:documents:all`);
+    const cached = cache.get<T[]>(cacheKey);
+    if (cached !== undefined) return cached;
+    const gen = cache.generation;
+
+    const rows: CrmDocument[] = [];
+    for (const kind of this.documents!.kinds) {
+      for (let page = 1; ; page++) {
+        const resp = await this.client.get<{ items: CrmDocument[]; page: number; pages: number }>(
+          "/documents", { kind, page },
+        );
+        rows.push(...resp.items);
+        if (page >= resp.pages) break;
+      }
+    }
+
+    const counterpartyCrmIds = rows.map(r => r.counterpartyId).filter((x): x is string => !!x);
+    const counterpartyNumericIds = await this.documentIdMap!.toNumeric("counterparty", counterpartyCrmIds);
+    const clientsIdByCrm = new Map<string, number>();
+    counterpartyCrmIds.forEach((cid, i) => clientsIdByCrm.set(cid, counterpartyNumericIds[i]!));
+
+    const docIds = await this.documentIdMap!.toNumeric("document", rows.map(r => r.id));
+    const items = rows.map((row, i) =>
+      this.fromDocument(row, docIds[i]!, row.counterpartyId ? clientsIdByCrm.get(row.counterpartyId)! : null),
+    );
+
+    cache.setIfSameGeneration(cacheKey, items, gen, 60);
+    return items;
+  }
+
+  private async getDocumentBacked(id: number): Promise<T> {
+    const crmId = (await this.documentIdMap!.toCrm("document", [id]))[0]!;
+    const doc = await this.client.get<CrmDocument>(`/documents/${crmId}`);
+    const clientsId = doc.counterpartyId
+      ? (await this.documentIdMap!.toNumeric("counterparty", [doc.counterpartyId]))[0]!
+      : null;
+    return this.fromDocument(doc, id, clientsId);
   }
 
   /**
@@ -312,7 +425,7 @@ export class BaseResource<T> {
     if (cached) return cached;
 
     const gen = cache.generation;
-    const result = await this.client.get<T>(`${this.basePath}/${id}`);
+    const result = this.documents ? await this.getDocumentBacked(id) : await this.client.get<T>(`${this.basePath}/${id}`);
     cache.setIfSameGeneration(cacheKey, result, gen, 120);
     return result;
   }
@@ -338,6 +451,14 @@ export class BaseResource<T> {
   }
 
   async delete(id: number): Promise<ApiResponse> {
+    if (this.documents) {
+      const crmId = (await this.documentIdMap!.toCrm("document", [id]))[0]!;
+      await this.mutate(
+        "delete", id, `${this.basePath}:${id}`, [this.basePath],
+        () => this.client.delete(`/documents/${crmId}`),
+      );
+      return { code: 200, messages: [] };
+    }
     return this.mutate(
       "delete",
       id,
@@ -352,12 +473,31 @@ export class BaseResource<T> {
   // (PUT to upload/replace, GET to read back, DELETE to remove). Calling these
   // on a resource whose API has no /{id}/document_user endpoint returns a 404 —
   // only the document-capable resources are wired to tools.
+  //
+  // Finding (R4a Task 25): for a document-backed resource, the CRM's only file route
+  // is `POST /documents/:id/file` (crm/src/lib/crm-mcp/writes-documents.ts:267-298),
+  // which records `{ fileRef, fileSha256 }` on a document that already has the bytes
+  // on disk under CRM_MCP_ATTACHMENTS — there is no GET/DELETE for the file content at
+  // all, and no route this fork can call to learn the `path` up front (that lookup is
+  // Task 30's CRM-extraction-record mapping). All three methods below refuse honestly.
 
   async getDocument(id: number): Promise<ApiFile> {
+    if (this.documents) {
+      throw new HttpError(
+        `${this.basePath}/${id}: the CRM has no route to read a document's stored file content back (writes-documents.ts:267-298 only records fileRef/fileSha256; there is no matching GET)`,
+        501, "GET", `${this.basePath}/${id}/document_user`,
+      );
+    }
     return this.client.get<ApiFile>(`${this.basePath}/${id}/document_user`);
   }
 
   async uploadDocument(id: number, name: string, contents: string): Promise<ApiResponse> {
+    if (this.documents) {
+      throw new HttpError(
+        `${this.basePath}/${id}: POST /documents/:id/file needs a { path, sha256 } inside CRM_MCP_ATTACHMENTS (writes-documents.ts:255-283) — the fork has no source for that path until Task 30 wires the CRM extraction record`,
+        501, "PUT", `${this.basePath}/${id}/document_user`,
+      );
+    }
     return this.mutate(
       "upload",
       id,
@@ -371,6 +511,12 @@ export class BaseResource<T> {
   }
 
   async deleteDocument(id: number): Promise<ApiResponse> {
+    if (this.documents) {
+      throw new HttpError(
+        `${this.basePath}/${id}: the CRM has no route to delete a document's attached file`,
+        501, "DELETE", `${this.basePath}/${id}/document_user`,
+      );
+    }
     return this.mutate(
       "delete",
       id,

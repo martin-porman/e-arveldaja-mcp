@@ -321,6 +321,12 @@ describe("classification operations — P0-2 plan binding", () => {
     expect(outcome.value.mode).toBe("EXECUTED");
     expect(api.purchaseInvoices.createAndSetTotals).toHaveBeenCalledTimes(1);
     expect(outcome.value.results[0]!.status).toBe("applied");
+    // The source is the bank transaction, not a file (plan R4a Task 25) — one
+    // document per bank line keeps re-classifying the same line idempotent.
+    expect(api.purchaseInvoices.createAndSetTotals).toHaveBeenCalledWith(
+      expect.objectContaining({ crm_source: { bank_transaction_id: SAAS_TX.id } }),
+      expect.anything(), expect.anything(), expect.anything(),
+    );
   });
 
   it("books the auto-created supplier invoice with an explicit client reassignment", async () => {

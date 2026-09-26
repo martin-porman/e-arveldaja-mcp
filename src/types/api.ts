@@ -225,6 +225,10 @@ export interface SaleInvoiceItem {
   projects_location_id?: number | null;
   projects_person_id?: number | null;
   vat_amount?: number;
+  /** A core v2 VAT code (src/crm/vat-map.ts) for a line `vatCodeFor` cannot derive from
+   * `vat_rate` alone — a 0 % sale (S0EX/S0EU/S0EUS/SEX/SOUT/SRC), for example. Additive,
+   * optional (plan R4a Task 25); never guessed when absent. */
+  crm_vat_code?: string | null;
 }
 
 export interface SaleInvoiceDelivery {
@@ -353,6 +357,11 @@ export interface PurchaseInvoiceItem {
   reversed_vat_id?: number | null;
   products_id?: number | null;
   project_no_vat_gross_price?: number | null;
+  /** A core v2 VAT code (src/crm/vat-map.ts) for a line `vatCodeFor` cannot derive from
+   * `vat_rate_dropdown`/`reversed_vat_id` alone — an intra-EU reverse charge on goods vs.
+   * services, or an exempt/import purchase, for example. Additive, optional (plan R4a
+   * Task 25); never guessed when absent. */
+  crm_vat_code?: string | null;
 }
 
 export interface PurchaseInvoice {
@@ -413,6 +422,15 @@ export interface CreatePurchaseInvoiceData extends Pick<PurchaseInvoice,
   "overdue_charge"
 > {
   items: PurchaseInvoiceItem[];
+  /** The workflow's own source for `sourceKeyFor` (src/crm/source-key.ts): a PDF's
+   * sha256, a mail Message-ID and its attachment index, or — for a purchase invoice
+   * auto-booked from a classified bank line — the RIK numeric id of that bank
+   * transaction (`bank_transaction_id`; `createAndSetTotals` resolves it to the CRM's
+   * own id via the id map before building the sourceKey). Additive, optional (plan
+   * R4a Task 25) — set by `create_purchase_invoice_from_pdf` from its snapshot's
+   * `source_sha256`, or by `apply_transaction_classifications` from the transaction id.
+   * Without one, `createAndSetTotals` refuses before any write. */
+  crm_source?: { sha256?: string; message_id?: string; index?: number; bank_transaction_id?: number };
 }
 
 // === Invoice Series ===

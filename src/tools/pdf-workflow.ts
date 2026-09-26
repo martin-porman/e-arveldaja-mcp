@@ -1003,6 +1003,10 @@ export function registerCreatePurchaseInvoiceFromPdfTool(server: McpServer, api:
         bank_account_no: params.bank_account_no,
         notes: tagNotes(params.notes),
         items,
+        // Identity value, not persisted business text — used verbatim like file_path
+        // above, so it comes from rawParams, not the desandboxed params (plan R4a Task 25:
+        // binds the CRM document's sourceKey to this exact reviewed file).
+        crm_source: { sha256: rawParams.source_sha256 },
       };
 
       let result;

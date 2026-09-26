@@ -526,6 +526,19 @@ describe("createAndMaybeMatchPurchaseInvoice", () => {
     expect(api.transactions.confirm.mock.calls[0]![2]).toEqual({ reassignClientToInvoice: true });
   });
 
+  it("passes the batch's own file digest as crm_source, not a re-hash (plan R4a Task 25)", async () => {
+    mockedValidateFilePath.mockResolvedValue("/tmp/receipt.pdf");
+    mockedReadFile.mockResolvedValue(Buffer.from("bytes") as any);
+    const { api, call } = buildCreateConfirmArgs([]);
+
+    await call();
+
+    expect(api.purchaseInvoices.createAndSetTotals).toHaveBeenCalledWith(
+      expect.objectContaining({ crm_source: { sha256: sha256Hex(Buffer.from("bytes")) } }),
+      expect.anything(), expect.anything(), expect.anything(),
+    );
+  });
+
   it("uploads the exact immutable receipt snapshot bytes", async () => {
     const bytes = Buffer.from("%PDF-approved");
     const snapshot: ReceiptFileSnapshot = {

@@ -1046,6 +1046,15 @@ describe("BaseResource", () => {
           dueDate: null, description: "", sourceKey: "manual:x", creditsDocumentId: null, lines: [],
         });
       }
+      // SaleInvoicesApi.update (Task 25) resolves id 5 to a CRM document id the same way,
+      // reads that document back for the full-draft PATCH body, then PATCHes.
+      if ((Api as unknown) === SaleInvoicesApi) {
+        vi.mocked(client.post).mockResolvedValue({ crmIds: ["doc5"] });
+        vi.mocked(client.get).mockResolvedValue({
+          id: "doc5", kind: "SALE_INVOICE", counterpartyId: null, docDate: "2026-01-01", turnoverDate: "2026-01-01",
+          dueDate: null, description: "", sourceKey: "manual:x", creditsDocumentId: null, lines: [],
+        });
+      }
       vi.mocked(client.patch).mockRejectedValueOnce(
         new HttpError("network ambiguity", "network", "PATCH", `${path}/5`),
       );

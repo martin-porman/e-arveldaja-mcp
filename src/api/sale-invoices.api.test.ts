@@ -1,63 +1,85 @@
-import { describe, it, expect, beforeEach, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { HttpClient } from "../http-client.js";
 import { SaleInvoicesApi } from "./sale-invoices.api.js";
 import { cache } from "./base-resource.js";
-import type { HttpClient } from "../http-client.js";
 
-vi.mock("../logger.js", () => ({ log: vi.fn() }));
-vi.mock("../progress.js", () => ({ reportProgress: vi.fn().mockResolvedValue(undefined) }));
+// `Response` defaults to `content-type: text/plain` for a plain string body — http-client.ts
+// branches on `content-type: application/json` before parsing the body as JSON — so every
+// stub response here sets it explicitly (journals.api.test.ts:10 uses the same fix).
+const json = (body: unknown) => new Response(JSON.stringify(body), { headers: { "content-type": "application/json" } });
 
-function makeClient(namespace = "connection:0"): HttpClient {
-  return {
-    cacheNamespace: namespace,
-    get: vi.fn(),
-    post: vi.fn(),
-    patch: vi.fn().mockResolvedValue({ code: 200, messages: [] }),
-    delete: vi.fn(),
-  } as unknown as HttpClient;
-}
-
-describe("SaleInvoicesApi.confirm", () => {
-  beforeEach(() => cache.invalidate());
-
-  it("calls PATCH /sale_invoices/{id}/register", async () => {
-    const client = makeClient();
-    const api = new SaleInvoicesApi(client);
-    await api.confirm(42);
-    expect(client.patch).toHaveBeenCalledWith("/sale_invoices/42/register", {});
-  });
-
-  it("busts /journals cache so trial balance doesn't serve stale data", async () => {
-    const client = makeClient();
-    const api = new SaleInvoicesApi(client);
-    cache.set("connection:0:/journals:list:page=1", { stale: true });
-    cache.set("connection:0:/sale_invoices:list:page=1", { stale: true });
-
-    await api.confirm(42);
-
-    expect(cache.get("connection:0:/journals:list:page=1")).toBeUndefined();
-    expect(cache.get("connection:0:/sale_invoices:list:page=1")).toBeUndefined();
-  });
+let ns = 0;
+const client = () => new HttpClient(
+  { baseUrl: "http://crm/api/crm-mcp", apiKeyId: "crm-mcp", apiPublicValue: "x", apiPassword: "t".repeat(43) },
+  `sale-invoices-test:${ns++}`,
+);
+afterEach(() => {
+  vi.unstubAllGlobals();
+  cache.invalidate();
 });
 
-describe("SaleInvoicesApi.invalidate", () => {
-  beforeEach(() => cache.invalidate());
+function stubFetch(handlers: Record<string, (init: RequestInit) => Response>) {
+  vi.stubGlobal("fetch", vi.fn(async (url: string, init: RequestInit = {}) => {
+    for (const [suffix, handler] of Object.entries(handlers)) {
+      if (url.endsWith(suffix)) return handler(init);
+    }
+    throw new Error(`unexpected ${init.method ?? "GET"} ${url}`);
+  }));
+}
 
-  it("calls PATCH /sale_invoices/{id}/invalidate", async () => {
-    const client = makeClient();
-    const api = new SaleInvoicesApi(client);
-    await api.invalidate(17);
-    expect(client.patch).toHaveBeenCalledWith("/sale_invoices/17/invalidate", {});
+describe("SaleInvoicesApi over the CRM", () => {
+  it("confirm is POST /documents/:id/confirm, mapped back through id-map", async () => {
+    stubFetch({
+      "/id-map": (init) => {
+        const body = JSON.parse(String(init.body));
+        return body.numericIds ? json({ crmIds: ["doc-crm-1"] }) : json({ numericIds: [900] });
+      },
+      "/documents/doc-crm-1/confirm": () => json({ entryId: "entry-crm-1" }),
+    });
+    const result = await new SaleInvoicesApi(client()).confirm(42);
+    expect(result).toEqual({ code: 200, created_object_id: 900, messages: [] });
   });
 
-  it("busts /journals cache so the reversed journal entry is not hidden by stale cache", async () => {
-    const client = makeClient();
-    const api = new SaleInvoicesApi(client);
-    cache.set("connection:0:/journals:list:page=1", { stale: true });
-    cache.set("connection:0:/sale_invoices:17", { stale: true });
+  it("invalidate DELETEs a DRAFT document instead of reversing it", async () => {
+    const calls: string[] = [];
+    stubFetch({
+      "/id-map": (init) => {
+        const body = JSON.parse(String(init.body));
+        calls.push(`id-map:${JSON.stringify(body)}`);
+        return json({ crmIds: ["doc-crm-2"] });
+      },
+      "/documents/doc-crm-2": (init) => {
+        calls.push(init.method ?? "GET");
+        return init.method === "DELETE" ? json({ ok: true }) : json({ status: "DRAFT" });
+      },
+    });
+    const result = await new SaleInvoicesApi(client()).invalidate(7);
+    expect(result).toEqual({ code: 200, messages: [] });
+    expect(calls).toContain("DELETE");
+  });
 
-    await api.invalidate(17);
+  it("invalidate reverses a POSTED document instead of deleting it", async () => {
+    stubFetch({
+      "/id-map": (init) => {
+        const body = JSON.parse(String(init.body));
+        return body.numericIds ? json({ crmIds: ["doc-crm-3"] }) : json({ numericIds: [901] });
+      },
+      "/documents/doc-crm-3/invalidate": () => json({ entryId: "entry-crm-3" }),
+      "/documents/doc-crm-3": () => json({ status: "POSTED" }),
+    });
+    const result = await new SaleInvoicesApi(client()).invalidate(8);
+    expect(result).toEqual({ code: 200, created_object_id: 901, messages: [] });
+  });
 
-    expect(cache.get("connection:0:/journals:list:page=1")).toBeUndefined();
-    expect(cache.get("connection:0:/sale_invoices:17")).toBeUndefined();
+  it.each([
+    ["getDeliveryOptions", (api: SaleInvoicesApi) => api.getDeliveryOptions(1)],
+    ["getSystemPdf", (api: SaleInvoicesApi) => api.getSystemPdf(1)],
+    ["getSystemXml", (api: SaleInvoicesApi) => api.getSystemXml(1)],
+    ["sendEinvoice", (api: SaleInvoicesApi) => api.sendEinvoice(1, {})],
+  ] as const)("%s switches outbound e-invoicing off honestly, with no network call", async (_name, call) => {
+    const fetchSpy = vi.fn();
+    vi.stubGlobal("fetch", fetchSpy);
+    await expect(call(new SaleInvoicesApi(client()))).rejects.toThrow(/switched off/);
+    expect(fetchSpy).not.toHaveBeenCalled();
   });
 });

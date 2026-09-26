@@ -1,371 +1,104 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { HttpClient } from "../http-client.js";
+import { sourceKeyFor } from "../crm/source-key.js";
 import { PurchaseInvoicesApi } from "./purchase-invoices.api.js";
-import { cache } from "./base-resource.js";
-import type { HttpClient } from "../http-client.js";
+import { SaleInvoicesApi } from "./sale-invoices.api.js";
 
-vi.mock("../logger.js", () => ({ log: vi.fn() }));
-vi.mock("../progress.js", () => ({ reportProgress: vi.fn().mockResolvedValue(undefined) }));
+// IdMap's memo (src/crm/id-map.ts:33-34) is keyed by `client.cacheNamespace` but shared
+// at module scope across every HttpClient instance in the process — a fresh
+// `cacheNamespace` per `client()` call keeps one test's counterparty resolution
+// (clients_id 12 → "ck-supplier") from leaking into another test's stub.
+let clientNamespace = 0;
+const client = () => new HttpClient(
+  { baseUrl: "http://crm/api/crm-mcp", apiKeyId: "crm-mcp", apiPublicValue: "x", apiPassword: "t".repeat(43) },
+  `test:${clientNamespace++}`,
+);
+afterEach(() => vi.unstubAllGlobals());
 
-function makeClient(namespace = "connection:0"): HttpClient {
-  return {
-    cacheNamespace: namespace,
-    get: vi.fn(),
-    post: vi.fn(),
-    patch: vi.fn().mockResolvedValue({ code: 200, messages: [] }),
-    delete: vi.fn(),
-  } as unknown as HttpClient;
+// `Response` defaults to `content-type: text/plain` for a plain string body — http-client.ts
+// branches on `content-type: application/json` before parsing the body as JSON (http-client.ts:242-255),
+// so every stub response here sets it explicitly (same fix as the shared helper in journals.api.test.ts:10).
+const json = (body: unknown) => new Response(JSON.stringify(body), { headers: { "content-type": "application/json" } });
+
+function stubCrm(calls: { method: string; url: string; body?: any }[]) {
+  vi.stubGlobal("fetch", vi.fn(async (url: string, init: RequestInit) => {
+    const body = init.body ? JSON.parse(String(init.body)) : undefined;
+    calls.push({ method: String(init.method ?? "GET"), url, body });
+    if (url.endsWith("/id-map") && body?.numericIds) return json({ crmIds: body.numericIds.map((n: number) => (n === 12 ? "ck-supplier" : String(n))) });
+    if (url.endsWith("/id-map")) return json({ numericIds: [501] });
+    if (url.endsWith("/counterparties/ck-supplier")) return json({ id: "ck-supplier", name: "Supplier OÜ", regCode: "12345678", vatNo: "EE100000000", country: "EE", isJuridical: true, isCustomer: false, isSupplier: true, isActive: true, iban: null });
+    if (url.endsWith("/documents") && init.method === "POST") return json({ id: "doc-1", created: true });
+    throw new Error(`unexpected ${init.method} ${url}`);
+  }));
 }
 
-describe("PurchaseInvoicesApi.confirm (cross-cache invalidation)", () => {
-  beforeEach(() => cache.invalidate());
+const data = {
+  clients_id: 12, client_name: "Supplier OÜ", number: "A-17", create_date: "2026-02-03", journal_date: "2026-02-03", term_days: 14, cl_currencies_id: "EUR", liability_accounts_id: 22,
+  items: [{ custom_title: "Hosting", purchase_accounts_id: 4000, total_net_price: 100, vat_rate_dropdown: "24", amount: 1 }],
+  crm_source: { sha256: "a".repeat(64) },
+};
 
-  it("busts /journals and /transactions caches when confirming", async () => {
-    const client = makeClient();
-    const api = new PurchaseInvoicesApi(client);
-    cache.set("connection:0:/journals:list:page=1", { stale: true });
-    cache.set("connection:0:/transactions:list:page=1", { stale: true });
-    cache.set("connection:0:/purchase_invoices:list:page=1", { stale: true });
-
-    await api.confirm(99);
-
-    expect(cache.get("connection:0:/journals:list:page=1")).toBeUndefined();
-    expect(cache.get("connection:0:/transactions:list:page=1")).toBeUndefined();
-    expect(cache.get("connection:0:/purchase_invoices:list:page=1")).toBeUndefined();
+describe("PurchaseInvoicesApi over the CRM", () => {
+  it("createAndSetTotals is ONE document create with core VAT codes — no create-then-PATCH", async () => {
+    const calls: { method: string; url: string; body?: any }[] = [];
+    stubCrm(calls);
+    const r = await new PurchaseInvoicesApi(client()).createAndSetTotals(data as never, 24, 124);
+    expect(r.created_object_id).toBe(501);
+    const writes = calls.filter((c) => c.method !== "GET" && !c.url.endsWith("/id-map"));
+    expect(writes).toHaveLength(1);
+    expect(writes[0]!.body).toMatchObject({
+      kind: "PURCHASE_INVOICE", sourceKey: `file:${"a".repeat(64)}`, number: "A-17", counterpartyId: "ck-supplier",
+      docDate: "2026-02-03", turnoverDate: "2026-02-03", dueDate: "2026-02-17",
+      lines: [{ accountCode: "4000", net: "100.00", vatCode: "P24", vatAmount: "24.00", side: null }],
+    });
+  });
+  it("refuses a line the VAT map cannot decide, naming the line, before any write", async () => {
+    const calls: { method: string; url: string; body?: any }[] = [];
+    stubCrm(calls);
+    const reverse = { ...data, items: [{ ...data.items[0], reversed_vat_id: 1 }] };
+    vi.mocked(fetch).mockImplementation(async (url: any, init: any) => {
+      calls.push({ method: String(init?.method ?? "GET"), url });
+      if (String(url).endsWith("/id-map")) return json({ crmIds: ["ck-de"] });
+      if (String(url).endsWith("/counterparties/ck-de")) return json({ id: "ck-de", name: "GmbH", regCode: null, vatNo: "DE1", country: "DE", isJuridical: true, isCustomer: false, isSupplier: true, isActive: true, iban: null });
+      throw new Error(`unexpected ${url}`);
+    });
+    await expect(new PurchaseInvoicesApi(client()).createAndSetTotals(reverse as never)).rejects.toThrow(/line 1: .*goods \(PEUG24\) or services \(PEUS24\)/);
+    expect(calls.some((c) => c.url.endsWith("/documents"))).toBe(false);
   });
 });
 
-describe("PurchaseInvoicesApi.invalidate (cross-cache invalidation)", () => {
-  beforeEach(() => cache.invalidate());
-
-  it("busts /journals and /transactions caches when invalidating", async () => {
-    const client = makeClient();
-    const api = new PurchaseInvoicesApi(client);
-    cache.set("connection:0:/journals:list:page=1", { stale: true });
-    cache.set("connection:0:/transactions:list:page=1", { stale: true });
-    cache.set("connection:0:/purchase_invoices:99", { stale: true });
-
-    await api.invalidate(99);
-
-    expect(cache.get("connection:0:/journals:list:page=1")).toBeUndefined();
-    expect(cache.get("connection:0:/transactions:list:page=1")).toBeUndefined();
-    expect(cache.get("connection:0:/purchase_invoices:99")).toBeUndefined();
+describe("SaleInvoicesApi over the CRM", () => {
+  it("switches outbound e-invoicing off honestly", async () => {
+    await expect(new SaleInvoicesApi(client()).sendEinvoice(1, {} as never)).rejects.toThrow(/switched off/);
   });
 });
 
-function h05Invoice(overrides: Record<string, unknown> = {}) {
-  return {
-    id: 1,
-    clients_id: 10,
-    client_name: "Supplier OÜ",
-    number: "PI-1",
-    create_date: "2026-03-01",
-    journal_date: "2026-03-01",
-    term_days: 0,
-    status: "PROJECT",
-    cl_currencies_id: "EUR",
-    net_price: 100,
-    vat_price: 23.99,
-    gross_price: 123.99,
-    currency_rate: 1,
-    base_net_price: 100,
-    base_vat_price: 23.99,
-    base_gross_price: 123.99,
-    items: [{
-      id: 11,
-      custom_title: "Consulting",
-      purchase_accounts_id: 5230,
-      amount: 1,
-      total_net_price: 100,
-      vat_amount: 24,
-      vat_rate_dropdown: "24",
-    }],
-    ...overrides,
-  };
-}
-
-function h05Api(get: ReturnType<typeof vi.fn>) {
-  const patch = vi.fn().mockResolvedValue({ code: 200, messages: [] });
-  const api = new PurchaseInvoicesApi({
-    cacheNamespace: "h05",
-    get,
-    patch,
-  } as any);
-  return { api, patch };
-}
-
-describe("H05 default preservation", () => {
-  beforeEach(() => cache.invalidate());
-
-  it.each([
-    ["supplier rounding", true, h05Invoice()],
-    ["missing VAT", true, h05Invoice({ vat_price: undefined })],
-    ["missing gross", true, h05Invoice({ gross_price: undefined })],
-    ["non-VAT item VAT", false, h05Invoice({ vat_price: 0 })],
-    ["reverse charge", true, h05Invoice({ items: [{ ...h05Invoice().items[0], reversed_vat_id: 1 }] })],
-    ["non-EUR", true, h05Invoice({ cl_currencies_id: "USD", currency_rate: 0.92 })],
-  ])("registers %s without reading or rewriting totals", async (_label, isVatRegistered, invoice) => {
-    const get = vi.fn().mockResolvedValue(invoice);
-    const { api, patch } = h05Api(get);
-
-    await api.confirmWithTotals(1, isVatRegistered as boolean);
-
-    expect(get).not.toHaveBeenCalled();
-    expect(patch).toHaveBeenCalledTimes(1);
-    expect(patch).toHaveBeenCalledWith("/purchase_invoices/1/register", {});
-  });
-
-  it("treats explicit recalculateTotals=false as the preserving default", async () => {
-    const get = vi.fn().mockResolvedValue(h05Invoice());
-    const { api, patch } = h05Api(get);
-
-    await api.confirmWithTotals(1, true, { recalculateTotals: false });
-
-    expect(get).not.toHaveBeenCalled();
-    expect(patch).toHaveBeenCalledTimes(1);
-    expect(patch).toHaveBeenCalledWith("/purchase_invoices/1/register", {});
+describe("sourceKeyFor", () => {
+  it("binds an invoice to its source, or refuses", () => {
+    expect(sourceKeyFor({ sha256: "ab".repeat(32) })).toBe(`file:${"ab".repeat(32)}`);
+    expect(sourceKeyFor({ message_id: "<x@y>", index: 2 })).toBe("mail:<x@y>#2");
+    expect(sourceKeyFor({ bank_transaction_id: "ck-bank-txn-1" })).toBe("bankline:ck-bank-txn-1");
+    expect(() => sourceKeyFor({})).toThrow(/without a source cannot be booked idempotently/);
   });
 });
 
-describe("H05 correction approval", () => {
-  beforeEach(() => cache.invalidate());
+describe("createAndSetTotals with a bank-transaction source", () => {
+  it("resolves the RIK bank transaction id through the id map and sends a bankline: sourceKey", async () => {
+    const calls: { method: string; url: string; body?: any }[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (url: string, init: RequestInit) => {
+      const body = init.body ? JSON.parse(String(init.body)) : undefined;
+      calls.push({ method: String(init.method ?? "GET"), url, body });
+      if (url.endsWith("/id-map") && body?.numericIds) return json({ crmIds: body.numericIds.map((n: number) => (n === 12 ? "ck-supplier" : n === 55 ? "ck-bank-txn-55" : String(n))) });
+      if (url.endsWith("/id-map")) return json({ numericIds: [501] });
+      if (url.endsWith("/counterparties/ck-supplier")) return json({ id: "ck-supplier", name: "Supplier OÜ", regCode: "12345678", vatNo: "EE100000000", country: "EE", isJuridical: true, isCustomer: false, isSupplier: true, isActive: true, iban: null });
+      if (url.endsWith("/documents") && init.method === "POST") return json({ id: "doc-1", created: true });
+      throw new Error(`unexpected ${init.method} ${url}`);
+    }));
+    const bankSourced = { ...data, crm_source: { bank_transaction_id: 55 } };
 
-  it("fresh-reads after invalidation and returns an exact no-mutation preview", async () => {
-    cache.set("h05:/purchase_invoices:1", h05Invoice({ vat_price: 999, gross_price: 999 }));
-    cache.set("h05:/purchase_invoices:list:page=1", { stale: true });
-    const get = vi.fn().mockResolvedValue(h05Invoice());
-    const { api, patch } = h05Api(get);
-
-    const preview = await api.previewTotalsCorrection(1, true);
-
-    expect(get).toHaveBeenCalledWith("/purchase_invoices/1");
-    expect(preview).toEqual({
-      invoice_id: 1,
-      is_vat_registered: true,
-      current_vat_price: 23.99,
-      current_gross_price: 123.99,
-      proposed_vat_price: 24,
-      proposed_gross_price: 124,
-      correction_required: true,
-      approval_digest: expect.stringMatching(/^[0-9a-f]{64}$/),
-    });
-    expect(patch).not.toHaveBeenCalled();
-    expect(cache.get("h05:/purchase_invoices:list:page=1")).toBeUndefined();
-  });
-
-  it.each([
-    ["status", h05Invoice({ status: "CONFIRMED" }), "correction_invoice_not_project"],
-    ["missing items", h05Invoice({ items: [] }), "correction_items_missing"],
-    ["reverse charge", h05Invoice({ items: [{ ...h05Invoice().items[0], reversed_vat_id: 2 }] }), "correction_reverse_charge_not_supported"],
-    ["currency", h05Invoice({ cl_currencies_id: "USD" }), "correction_currency_not_supported"],
-  ])("rejects ineligible %s without mutation", async (_label, invoice, code) => {
-    const get = vi.fn().mockResolvedValue(invoice);
-    const { api, patch } = h05Api(get);
-
-    await expect(api.previewTotalsCorrection(1, true)).rejects.toMatchObject({ code });
-    expect(patch).not.toHaveBeenCalled();
-  });
-
-  it("requires an approval before any correction read or mutation", async () => {
-    const get = vi.fn().mockResolvedValue(h05Invoice());
-    const { api, patch } = h05Api(get);
-
-    await expect(api.confirmWithTotals(1, true, { recalculateTotals: true }))
-      .rejects.toMatchObject({ code: "correction_preview_required" });
-
-    expect(get).not.toHaveBeenCalled();
-    expect(patch).not.toHaveBeenCalled();
-  });
-
-  it("rejects approval without explicit recalculation before any read or mutation", async () => {
-    const get = vi.fn().mockResolvedValue(h05Invoice());
-    const { api, patch } = h05Api(get);
-    const approval = { invoice_id: 1 } as any;
-
-    await expect(api.confirmWithTotals(1, true, { approvedCorrection: approval } as any))
-      .rejects.toMatchObject({ code: "correction_preview_mismatch" });
-
-    expect(get).not.toHaveBeenCalled();
-    expect(patch).not.toHaveBeenCalled();
-  });
-
-  it.each([
-    [true, 24, 124],
-    [false, 0, 124],
-  ])("applies a matching approval for VAT mode %s and then registers", async (isVatRegistered, expectedVat, expectedGross) => {
-    const invoice = h05Invoice();
-    const get = vi.fn().mockResolvedValue(invoice);
-    const { api, patch } = h05Api(get);
-    const approval = await api.previewTotalsCorrection(1, isVatRegistered);
-
-    await api.confirmWithTotals(1, isVatRegistered, {
-      recalculateTotals: true,
-      approvedCorrection: approval,
-    });
-
-    expect(get).toHaveBeenCalledTimes(2);
-    expect(patch).toHaveBeenNthCalledWith(1, "/purchase_invoices/1", {
-      vat_price: expectedVat,
-      gross_price: expectedGross,
-      items: invoice.items,
-    });
-    expect(patch).toHaveBeenNthCalledWith(2, "/purchase_invoices/1/register", {});
-  });
-
-  it("registers without a totals update when the approved correction is a no-op", async () => {
-    const invoice = h05Invoice({ vat_price: 24, gross_price: 124 });
-    const get = vi.fn().mockResolvedValue(invoice);
-    const { api, patch } = h05Api(get);
-    const approval = await api.previewTotalsCorrection(1, true);
-
-    expect(approval.correction_required).toBe(false);
-    await api.confirmWithTotals(1, true, { recalculateTotals: true, approvedCorrection: approval });
-
-    expect(patch).toHaveBeenCalledTimes(1);
-    expect(patch).toHaveBeenCalledWith("/purchase_invoices/1/register", {});
-  });
-
-  it.each([
-    ["missing items", { items: [] }, "correction_items_missing"],
-    ["reverse charge", { items: [{ ...h05Invoice().items[0], reversed_vat_id: 1 }] }, "correction_reverse_charge_not_supported"],
-  ])("rechecks apply-time %s eligibility", async (_label, drift, code) => {
-    const initial = h05Invoice();
-    const get = vi.fn()
-      .mockResolvedValueOnce(initial)
-      .mockResolvedValueOnce({ ...initial, ...drift });
-    const { api, patch } = h05Api(get);
-    const approval = await api.previewTotalsCorrection(1, true);
-
-    await expect(api.confirmWithTotals(1, true, { recalculateTotals: true, approvedCorrection: approval }))
-      .rejects.toMatchObject({ code });
-    expect(patch).not.toHaveBeenCalled();
-  });
-
-  it("sorts object keys recursively while preserving semantic approval state", async () => {
-    const first = h05Invoice();
-    const reversedItem = Object.fromEntries(Object.entries(first.items[0]).reverse());
-    const second = Object.fromEntries(Object.entries({ ...first, items: [reversedItem] }).reverse());
-    const firstPreview = await h05Api(vi.fn().mockResolvedValue(first)).api
-      .previewTotalsCorrection(1, true);
-    const secondPreview = await h05Api(vi.fn().mockResolvedValue(second)).api
-      .previewTotalsCorrection(1, true);
-
-    expect(secondPreview.approval_digest).toBe(firstPreview.approval_digest);
-  });
-
-  it.each([
-    ["status", { status: "CONFIRMED" }, "correction_invoice_not_project"],
-    ["net_price", { net_price: 101 }, "correction_preview_mismatch"],
-    ["vat_price", { vat_price: 23.98 }, "correction_preview_mismatch"],
-    ["gross_price", { gross_price: 123.98 }, "correction_preview_mismatch"],
-    ["currency", { cl_currencies_id: "USD" }, "correction_currency_not_supported"],
-    ["currency_rate", { currency_rate: 0.99 }, "correction_preview_mismatch"],
-    ["base_net_price undefined to concrete", { base_net_price: 101 }, "correction_preview_mismatch"],
-    ["base_vat_price concrete to null", { base_vat_price: null }, "correction_preview_mismatch"],
-    ["base_gross_price", { base_gross_price: 124 }, "correction_preview_mismatch"],
-  ])("rejects fresh %s drift before mutation", async (_label, drift, code) => {
-    const initial = _label === "base_net_price undefined to concrete"
-      ? h05Invoice({ base_net_price: undefined })
-      : h05Invoice();
-    const get = vi.fn()
-      .mockResolvedValueOnce(initial)
-      .mockResolvedValueOnce({ ...initial, ...drift });
-    const { api, patch } = h05Api(get);
-    const approval = await api.previewTotalsCorrection(1, true);
-
-    await expect(api.confirmWithTotals(1, true, { recalculateTotals: true, approvedCorrection: approval }))
-      .rejects.toMatchObject({ code });
-    expect(patch).not.toHaveBeenCalled();
-  });
-
-  it.each([
-    ["VAT registration", false, h05Invoice()],
-    ["proposed totals", true, h05Invoice({ items: [{ ...h05Invoice().items[0], total_net_price: 101, vat_amount: 24.24 }] })],
-    ["non-total item field", true, h05Invoice({ items: [{ ...h05Invoice().items[0], purchase_accounts_id: 5240 }] })],
-    ["item order", true, h05Invoice({ items: [
-      { ...h05Invoice().items[0], id: 12, custom_title: "Second", total_net_price: 0, vat_amount: 0 },
-      h05Invoice().items[0],
-    ] })],
-  ])("binds approval to %s", async (_label, applyVatMode, changedInvoice) => {
-    const initial = _label === "item order"
-      ? h05Invoice({ items: [h05Invoice().items[0], { ...h05Invoice().items[0], id: 12, custom_title: "Second", total_net_price: 0, vat_amount: 0 }] })
-      : h05Invoice();
-    const get = vi.fn().mockResolvedValueOnce(initial).mockResolvedValueOnce(changedInvoice);
-    const { api, patch } = h05Api(get);
-    const approval = await api.previewTotalsCorrection(1, true);
-
-    await expect(api.confirmWithTotals(1, applyVatMode as boolean, { recalculateTotals: true, approvedCorrection: approval }))
-      .rejects.toMatchObject({ code: "correction_preview_mismatch" });
-    expect(patch).not.toHaveBeenCalled();
-  });
-
-  it.each([
-    ["invoice id", { invoice_id: 2 }],
-    ["VAT flag", { is_vat_registered: false }],
-    ["proposed value", { proposed_gross_price: 999 }],
-    ["digest", { approval_digest: "0".repeat(64) }],
-    ["missing field", { current_vat_price: undefined }],
-    ["extra field", { unexpected: true }],
-    ["non-finite", { proposed_vat_price: Number.POSITIVE_INFINITY }],
-  ])("rejects tampered approval %s", async (_label, tamper) => {
-    const invoice = h05Invoice();
-    const get = vi.fn().mockResolvedValue(invoice);
-    const { api, patch } = h05Api(get);
-    const approval = await api.previewTotalsCorrection(1, true);
-    const tampered = { ...approval, ...tamper };
-    if (_label === "missing field") delete tampered.current_vat_price;
-
-    await expect(api.confirmWithTotals(1, true, { recalculateTotals: true, approvedCorrection: tampered } as any))
-      .rejects.toMatchObject({ code: "correction_preview_mismatch" });
-    expect(patch).not.toHaveBeenCalled();
-  });
-});
-
-describe("PurchaseInvoicesApi.createAndSetTotals", () => {
-  it("invalidates the created invoice when follow-up totals repair fails", async () => {
-    const post = vi.fn().mockResolvedValue({ code: 200, created_object_id: 17, messages: [] });
-    const get = vi.fn().mockResolvedValue({
-      id: 17,
-      items: [{
-        total_net_price: 100,
-        vat_amount: 24,
-      }],
-    });
-    const patch = vi.fn().mockImplementation(async (path: string) => {
-      if (path === "/purchase_invoices/17") {
-        throw new Error("patch failed");
-      }
-      if (path === "/purchase_invoices/17/invalidate") {
-        return { code: 200, messages: [] };
-      }
-      throw new Error(`Unexpected PATCH ${path}`);
-    });
-
-    const api = new PurchaseInvoicesApi({
-      cacheNamespace: "test",
-      post,
-      get,
-      patch,
-    } as any);
-
-    await expect(api.createAndSetTotals({
-      clients_id: 10,
-      client_name: "OpenAI Ireland Limited",
-      number: "PI-17",
-      create_date: "2026-03-01",
-      journal_date: "2026-03-01",
-      term_days: 0,
-      cl_currencies_id: "EUR",
-      liability_accounts_id: 2310,
-      items: [{
-        custom_title: "ChatGPT subscription",
-        amount: 1,
-        total_net_price: 100,
-      }],
-    }, 24, 124, true)).rejects.toThrow(
-      "Purchase invoice 17 was created but follow-up failed and the draft was invalidated: patch failed"
-    );
-
-    expect(post).toHaveBeenCalledTimes(1);
-    expect(patch).toHaveBeenCalledWith("/purchase_invoices/17/invalidate", {});
+    const r = await new PurchaseInvoicesApi(client()).createAndSetTotals(bankSourced as never);
+    expect(r.created_object_id).toBe(501);
+    const write = calls.find((c) => c.url.endsWith("/documents") && c.method === "POST");
+    expect(write?.body).toMatchObject({ sourceKey: "bankline:ck-bank-txn-55" });
   });
 });

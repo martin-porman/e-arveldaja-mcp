@@ -1,10 +1,43 @@
 import { createHash } from "node:crypto";
-import type { HttpClient } from "../http-client.js";
-import type { PurchaseInvoice, PurchaseInvoiceItem, CreatePurchaseInvoiceData, ApiResponse } from "../types/api.js";
+import { HttpError, type HttpClient } from "../http-client.js";
+import type { PurchaseInvoice, CreatePurchaseInvoiceData, ApiResponse } from "../types/api.js";
 import type { CreatePurchaseInvoiceRequest, UpdatePurchaseInvoiceRequest } from "../types/mutations.js";
 import { BaseResource } from "./base-resource.js";
 import { roundMoney, parseVatRateDropdown } from "../money.js";
+import { IdMap } from "../crm/id-map.js";
+import { vatCodeFor } from "../crm/vat-map.js";
+import { sourceKeyFor } from "../crm/source-key.js";
+import type { CrmCounterparty } from "../crm/mappers.js";
 
+/** Refuses an amount the CRM cannot store exactly (money is a two-decimal string). */
+function moneyString(amount: number): string {
+  if (Math.abs(amount * 100 - Math.round(amount * 100)) > 1e-6) {
+    throw new Error(`${amount}: more than two decimals: the CRM does not round money`);
+  }
+  return (Math.round(amount * 100) / 100).toFixed(2);
+}
+
+function addDaysUtc(dateStr: string, days: number): string {
+  const [y, m, d] = dateStr.split("-").map(Number) as [number, number, number];
+  const dt = new Date(Date.UTC(y, m - 1, d));
+  dt.setUTCDate(dt.getUTCDate() + days);
+  return dt.toISOString().slice(0, 10);
+}
+
+function todayTallinn(): string {
+  return new Date().toLocaleDateString("en-CA", { timeZone: "Europe/Tallinn" });
+}
+
+type CrmDraftDocument = { status: "DRAFT" | "POSTED" | "REVERSED" };
+
+/**
+ * Kept only for the external `instanceof` contract at documents/operations.ts:39,554,
+ * pdf-workflow.ts:12,1021, and guided/process-accounting-document.test.ts:13,380 (the
+ * T24 `LinkedInvoiceClientMismatchError` precedent, transactions.api.ts:43-50).
+ * Finding: `createAndSetTotals` below is a single `POST /documents` with no follow-up
+ * write to roll back, so this fork no longer throws it itself — the "created but the
+ * next step failed" scenario it described (create-then-PATCH) is gone with the quirk.
+ */
 export class InvoiceCreationError extends Error {
   constructor(message: string, public readonly invoiceId: number, options?: ErrorOptions) {
     super(message, options);
@@ -125,46 +158,13 @@ function isCorrectionPreview(value: unknown): value is PurchaseInvoiceTotalsCorr
     typeof record.approval_digest === "string" && /^[0-9a-f]{64}$/.test(record.approval_digest);
 }
 
-/**
- * For non-VAT companies: set project_no_vat_gross_price on items
- * so the API computes item-level vat_amount for informational tracking.
- * Without this field, item vat_amount stays 0 and gross_price = net_price.
- */
-function normalizeItemsForNonVat(
-  items: PurchaseInvoiceItem[],
-  isVatRegistered: boolean,
-  grossPrice?: number,
-) : PurchaseInvoiceItem[] {
-  if (!items || isVatRegistered) return items;
-
-  return items.map(item => {
-    // Preserve caller-provided value
-    if (item.project_no_vat_gross_price != null) return item;
-
-    const net = item.total_net_price
-      ?? (item.unit_net_price !== undefined && item.amount !== undefined
-        ? roundMoney(item.unit_net_price * item.amount)
-        : undefined);
-
-    const rate = item.vat_rate_dropdown !== undefined
-      ? parseVatRateDropdown(item.vat_rate_dropdown)
-      : undefined;
-
-    // Single-item invoice: use explicit gross_price if available
-    const derivedGross =
-      items.length === 1 && grossPrice !== undefined ? grossPrice :
-      net !== undefined && rate !== undefined ? roundMoney(net * (1 + rate / 100)) :
-      undefined;
-
-    if (derivedGross === undefined) return item; // best-effort: skip if not derivable
-
-    return { ...item, project_no_vat_gross_price: derivedGross };
-  });
-}
 
 export class PurchaseInvoicesApi extends BaseResource<PurchaseInvoice> {
+  private readonly crmIdMap: IdMap;
+
   constructor(client: HttpClient) {
     super(client, "/purchase_invoices");
+    this.crmIdMap = new IdMap(client);
   }
 
   // Narrow the create/update boundary from `Partial<PurchaseInvoice>` to request
@@ -181,135 +181,109 @@ export class PurchaseInvoicesApi extends BaseResource<PurchaseInvoice> {
   }
 
   /**
-   * Create a purchase invoice and set invoice-level totals.
-   * The API does not auto-compute vat_price/gross_price at invoice level,
-   * so we PATCH them after creation based on item-level VAT amounts.
-   * If explicit vatPrice/grossPrice are given, those are used (to match the original invoice exactly).
+   * Create a purchase invoice as ONE CRM document (plan R4a Task 25, spec §2.3):
+   * every item's VAT is mapped to a core v2 code via `vatCodeFor` before any write,
+   * then a single `POST /documents` — the old create-then-PATCH-totals quirk (see
+   * git history) is gone because the CRM computes and stores each line's own
+   * `vatAmount` server-side from the `vatCode`/`net` we send (contract C5).
    *
-   * For non-VAT companies (isVatRegistered=false): invoice-level vat_price stays 0
-   * because input VAT is not deductible. gross_price is still set to actual payable amount.
-   * Items get project_no_vat_gross_price set for VAT tracking.
+   * `vatPrice`/`grossPrice`/`isVatRegistered` are kept for callers that still pass
+   * them (pdf-workflow.ts, receipt-inbox-booking.ts, receipts/classification-operations.ts):
+   * an explicit `vatPrice`/`grossPrice` overrides the summed line totals in the
+   * *returned* invoice only (not sent back to the CRM as a correction — there is no
+   * readback after the create); `isVatRegistered=false` still zeroes the returned
+   * `vat_price` the same way it did before. There is no per-line rounding-difference
+   * push onto the last line any more: each line's `vatAmount` is exactly what the
+   * CRM will compute from its own `vatCode`, so drifting it to match an explicit
+   * `vatPrice` would desync the request from what the server actually stores.
    *
-   * For foreign-currency invoices (cl_currencies_id != "EUR"):
-   * data.currency_rate is required (EUR per 1 foreign unit). base_net_price /
-   * base_vat_price / base_gross_price can be supplied explicitly to match the
-   * actual EUR settlement (e.g. Wise card-payment rate); otherwise they are
-   * auto-derived as round(amount * currency_rate, 2). For EUR invoices the
-   * base_* fields are forced to mirror the foreign-currency totals so the
-   * server-side payment matcher does not see a phantom rounding gap.
+   * Finding: `CreatePurchaseInvoiceData` (types/api.ts:397-416) carries no credit-note
+   * flag, so every call creates `kind: "PURCHASE_INVOICE"` — `PURCHASE_CREDIT` is
+   * unreachable from this method (never inferred from a negative amount).
    */
   async createAndSetTotals(
     data: CreatePurchaseInvoiceData,
     vatPrice?: number,
     grossPrice?: number,
     isVatRegistered = true,
-  ): Promise<PurchaseInvoice> {
-    const currency = (data.cl_currencies_id ?? "EUR").toUpperCase();
-    const isForeignCurrency = currency !== "EUR";
-    if (isForeignCurrency && (data.currency_rate === undefined || data.currency_rate === null || !Number.isFinite(data.currency_rate) || data.currency_rate <= 0)) {
-      throw new Error(
-        `currency_rate is required when cl_currencies_id="${currency}". ` +
-        `Pass the EUR-per-${currency} rate (for Wise card payments use Source amount / Target amount from the Wise CSV).`
-      );
-    }
-    const normalizedItems = normalizeItemsForNonVat(
-      data.items,
-      isVatRegistered,
-      grossPrice,
-    );
-    const createData: CreatePurchaseInvoiceData = {
-      ...data,
-      items: normalizedItems,
+  ): Promise<PurchaseInvoice & { created_object_id: number }> {
+    const bankTransactionCrmId = data.crm_source?.bank_transaction_id != null
+      ? (await this.crmIdMap.toCrm("bank_transaction", [data.crm_source.bank_transaction_id]))[0]
+      : undefined;
+    const sourceKey = sourceKeyFor({ ...(data.crm_source ?? {}), bank_transaction_id: bankTransactionCrmId });
+    const counterpartyCrmId = (await this.crmIdMap.toCrm("counterparty", [data.clients_id]))[0]!;
+    const counterparty = await this.client.get<CrmCounterparty>(`/counterparties/${counterpartyCrmId}`);
+    const turnoverDate = data.journal_date;
+
+    type CrmLine = {
+      description: string; quantity: string | null; unitPrice: string | null; net: string;
+      side: null; vatCode: string; vatAmount: string; accountCode: string; dimensionId: string | null;
     };
-    const response = await this.create(createData);
-    const id = response.created_object_id;
-    if (!id) throw new Error("Purchase invoice created but no ID returned");
+    const lines: CrmLine[] = [];
+    let netTotal = 0;
+    let vatTotal = 0;
+    for (let i = 0; i < data.items.length; i++) {
+      const item = data.items[i]!;
+      const rate = item.vat_rate_dropdown ?? (item.vat_rate != null ? String(item.vat_rate) : null);
+      const reversed = item.reversed_vat_id != null;
+      const mapped = vatCodeFor({
+        direction: "IN", rate, reversed, partyCountry: counterparty.country, turnoverDate,
+        explicit: item.crm_vat_code ?? null,
+      });
+      if ("problem" in mapped) throw new HttpError(`line ${i + 1}: ${mapped.problem}`, 422, "POST", "/documents");
 
-    try {
-      // Read back to get item-level VAT computed by API
-      const invoice = await this.get(id);
-      const apiItems = invoice.items;
+      const net = item.total_net_price ?? roundMoney((item.unit_net_price ?? 0) * (item.amount ?? 1));
+      const vatAmount = item.vat_amount !== undefined
+        ? item.vat_amount
+        : reversed ? 0 : roundMoney(net * (parseVatRateDropdown(rate) / 100));
+      const accountCode = item.purchase_accounts_id != null
+        ? (await this.crmIdMap.toCrm("account", [item.purchase_accounts_id]))[0]!
+        : "";
 
-      const itemVat = apiItems ? roundMoney(apiItems.reduce((s, i) => s + (i.vat_amount ?? 0), 0)) : 0;
-      const itemNet = apiItems ? roundMoney(apiItems.reduce((s, i) => s + (i.total_net_price ?? 0), 0)) : 0;
-
-      // Invoice-level VAT: explicit value wins for VAT-registered companies.
-      // Non-VAT companies must keep invoice-level vat_price at 0 even if item VAT is tracked.
-      const vat = isVatRegistered
-        ? (vatPrice !== undefined ? vatPrice : itemVat)
-        : 0;
-
-      // Invoice-level gross: explicit value wins, otherwise net + actual item VAT
-      const gross = grossPrice !== undefined
-        ? grossPrice
-        : roundMoney(itemNet + itemVat);
-
-      // Merge API-returned item IDs back into our original items (preserving
-      // cl_fringe_benefits_id and other fields the API GET doesn't return).
-      // If the API items have different count (shouldn't happen), fall back to API items.
-      const patchItems = apiItems && apiItems.length === normalizedItems.length
-        ? normalizedItems.map((orig, idx) => ({
-            ...orig,
-            id: apiItems[idx]!.id,
-            // Let the API recompute vat_amount from our fields
-          }))
-        : apiItems;
-
-      // When explicit VAT differs from item-computed VAT (rounding), adjust
-      // project_no_vat_gross_price on items so the API computes matching totals.
-      if (patchItems && patchItems.length > 0 && vatPrice !== undefined && isVatRegistered && itemVat !== vatPrice) {
-        const vatDiff = roundMoney(vatPrice - itemVat);
-        // Apply the rounding difference to the last item's gross
-        const lastItem = patchItems[patchItems.length - 1]!;
-        const currentGross = lastItem.project_no_vat_gross_price
-          ?? roundMoney((lastItem.total_net_price ?? 0) + (apiItems?.[patchItems.length - 1]?.vat_amount ?? 0));
-        lastItem.project_no_vat_gross_price = roundMoney(currentGross + vatDiff);
-      }
-
-      const patchPayload: Partial<PurchaseInvoice> = {
-        vat_price: vat,
-        gross_price: gross,
-        items: patchItems,
-      };
-
-      if (isForeignCurrency) {
-        const rate = data.currency_rate!;
-        const net = roundMoney(itemNet);
-        const baseNet = data.base_net_price ?? roundMoney(net * rate);
-        const baseGross = data.base_gross_price ?? roundMoney(gross * rate);
-        // Derive base_vat as the residual of base_gross − base_net so the trio
-        // reconciles exactly (base_net + base_vat === base_gross). Rounding net,
-        // vat, and gross independently against the rate can leave them off by a
-        // cent, which fails API sum validation or re-trips currency rounding.
-        const baseVat = data.base_vat_price ?? roundMoney(baseGross - baseNet);
-        patchPayload.cl_currencies_id = currency;
-        patchPayload.currency_rate = rate;
-        patchPayload.base_net_price = baseNet;
-        patchPayload.base_vat_price = baseVat;
-        patchPayload.base_gross_price = baseGross;
-      }
-
-      await this.update(id, patchPayload);
-
-      return this.get(id);
-    } catch (error) {
-      const followUpMessage = error instanceof Error ? error.message : String(error);
-      try {
-        await this.invalidate(id);
-      } catch (invalidateError) {
-        const invalidateMessage = invalidateError instanceof Error ? invalidateError.message : String(invalidateError);
-        throw new InvoiceCreationError(
-          `Purchase invoice ${id} was created but follow-up failed: ${followUpMessage}. ` +
-          `Automatic invalidation also failed: ${invalidateMessage}`,
-          id,
-        );
-      }
-
-      throw new InvoiceCreationError(
-        `Purchase invoice ${id} was created but follow-up failed and the draft was invalidated: ${followUpMessage}`,
-        id,
-      );
+      netTotal = roundMoney(netTotal + net);
+      vatTotal = roundMoney(vatTotal + vatAmount);
+      lines.push({
+        description: item.custom_title ?? "",
+        quantity: item.amount != null ? String(item.amount) : null,
+        unitPrice: item.unit_net_price != null ? moneyString(item.unit_net_price) : null,
+        net: moneyString(net),
+        side: null,
+        vatCode: mapped.code,
+        vatAmount: moneyString(vatAmount),
+        accountCode,
+        dimensionId: null,
+      });
     }
+
+    const body = {
+      kind: "PURCHASE_INVOICE" as const,
+      sourceKey,
+      number: data.number,
+      counterpartyId: counterpartyCrmId,
+      docDate: data.create_date,
+      turnoverDate,
+      dueDate: addDaysUtc(data.create_date, data.term_days),
+      description: data.notes ?? "",
+      creditsDocumentId: null,
+      lines,
+    };
+    const created = await this.mutate<{ id: string; created: boolean }>(
+      "create", undefined, `${this.basePath}:create`, [this.basePath],
+      () => this.client.post<{ id: string; created: boolean }>("/documents", body),
+    );
+    const numericId = (await this.crmIdMap.toNumeric("document", [created.id]))[0]!;
+
+    const vat = isVatRegistered ? (vatPrice !== undefined ? vatPrice : vatTotal) : 0;
+    const gross = grossPrice !== undefined ? grossPrice : roundMoney(netTotal + vatTotal);
+    return {
+      ...data,
+      id: numericId,
+      created_object_id: numericId,
+      status: "PROJECT",
+      net_price: netTotal,
+      vat_price: vat,
+      gross_price: gross,
+    };
   }
 
   private async getFreshInvoice(id: number): Promise<PurchaseInvoice> {
@@ -421,25 +395,68 @@ export class PurchaseInvoicesApi extends BaseResource<PurchaseInvoice> {
     return this.confirm(id);
   }
 
+  /** `POST /documents/:id/confirm` (plan R4a Task 25, spec §2.3) — registering a
+   * purchase invoice creates a journal entry server-side and can flip payment_status
+   * on a linked transaction, so both caches are busted alongside this resource's own. */
   async confirm(id: number): Promise<ApiResponse> {
-    const result = await this.client.patch<ApiResponse>(`/purchase_invoices/${id}/register`, {});
-    this.invalidateCache();
-    // Registering a purchase invoice creates a journal server-side and can
-    // flip payment_status on any linked transaction — bust both caches.
-    this.invalidateCache("/journals");
-    this.invalidateCache("/transactions");
-    return result;
+    const crmId = (await this.crmIdMap.toCrm("document", [id]))[0]!;
+    const result = await this.mutate<{ entryId: string }>(
+      "confirm", id, `${this.basePath}:${id}:confirm`, [this.basePath, "/journals", "/transactions"],
+      () => this.client.post<{ entryId: string }>(`/documents/${crmId}/confirm`, {}),
+    );
+    const entryId = (await this.crmIdMap.toNumeric("entry", [result.entryId]))[0];
+    return { code: 200, created_object_id: entryId, messages: [] };
   }
 
+  /**
+   * RIK's one `/invalidate` route covered both a draft and a registered invoice; the
+   * CRM splits the two (spec R4a Task 25): a DRAFT document has no journal entry yet,
+   * so the only way to discard it is `DELETE /documents/:id` (the same route
+   * `TransactionsApi.invalidate` needs a confirmed document for, transactions.api.ts:274-289,
+   * has no equivalent for — a draft here is simply removed); a POSTED document is
+   * reversed via `POST /documents/:id/invalidate`, mirroring journals.api.ts:250-260.
+   */
   async invalidate(id: number): Promise<ApiResponse> {
-    const result = await this.client.patch<ApiResponse>(`/purchase_invoices/${id}/invalidate`, {});
-    this.invalidateCache();
-    this.invalidateCache("/journals");
-    this.invalidateCache("/transactions");
-    return result;
+    const crmId = (await this.crmIdMap.toCrm("document", [id]))[0]!;
+    const doc = await this.client.get<CrmDraftDocument>(`/documents/${crmId}`);
+    if (doc.status === "DRAFT") {
+      await this.mutate(
+        "delete", id, `${this.basePath}:${id}:invalidate`, [this.basePath, "/journals", "/transactions"],
+        () => this.client.delete(`/documents/${crmId}`),
+      );
+      return { code: 200, messages: [] };
+    }
+    const result = await this.mutate<{ entryId: string }>(
+      "invalidate", id, `${this.basePath}:${id}:invalidate`, [this.basePath, "/journals", "/transactions"],
+      () => this.client.post<{ entryId: string }>(`/documents/${crmId}/invalidate`, {
+        reason: "invalidated by the approved plan", entryDate: todayTallinn(),
+      }),
+    );
+    const entryId = (await this.crmIdMap.toNumeric("entry", [result.entryId]))[0];
+    return { code: 200, created_object_id: entryId, messages: [] };
   }
 
-  // getDocument / uploadDocument / deleteDocument are inherited from BaseResource
-  // (document_user is generic across purchase_invoices, sale_invoices, journals,
-  // and transactions).
+  // getDocument / deleteDocument stay inherited from BaseResource, unchanged
+  // (/purchase_invoices/:id/document_user) — document-methods.test.ts pins them.
+
+  /**
+   * `POST /documents/:id/file` needs a `{ path, sha256 }` of a file the CRM already
+   * has on disk under CRM_MCP_ATTACHMENTS (crm/src/lib/crm-mcp/writes-documents.ts:255-283).
+   * Finding: this fork has no route to learn that `path` — it comes from the CRM's
+   * extraction record, which Task 30 wires up. Hashing the caller's base64 `contents`
+   * now (so Task 30 only has to plug in the path) and refusing honestly rather than
+   * inventing a path. Consequence: every booking flow that uploads right after create
+   * (pdf-workflow.ts:1031, receipt-inbox-booking.ts:293, documents/operations.ts:575)
+   * will hit this 501 and roll back (invalidate) the invoice it just created, until
+   * Task 30 lands.
+   */
+  override async uploadDocument(id: number, _name: string, contents: string): Promise<ApiResponse> {
+    const sha256 = createHash("sha256").update(Buffer.from(contents, "base64")).digest("hex");
+    throw new HttpError(
+      `purchase_invoices/${id}: POST /documents/:id/file needs a { path, sha256 } inside CRM_MCP_ATTACHMENTS — ` +
+      `the fork has no source for that on-disk path until Task 30 wires the CRM extraction record ` +
+      `(sha256 of the given contents: ${sha256})`,
+      501, "PUT", `/purchase_invoices/${id}/document_user`,
+    );
+  }
 }
