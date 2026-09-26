@@ -155,6 +155,9 @@ describe("AccountingDocumentOperations.create", () => {
         fixtureAccount({ id: 5000, name_est: "Teenused" }),
         fixtureAccount({ id: 5900, name_est: "Muud kulud" }),
         fixtureAccount({ id: 1510, name_est: "Sisendkäibemaks", is_vat_account: true }),
+        // F7: role-tagged so the PAYABLE role-based fallback (no more
+        // hard-coded DEFAULT_LIABILITY_ACCOUNT) resolves a liability account.
+        fixtureAccount({ id: 2310, name_est: "Tarnijate võlgnevus", cl_account_groups: ["PAYABLE"] }),
       ],
       clients: { get: vi.fn().mockResolvedValue(supplier()) },
       purchaseInvoices: {

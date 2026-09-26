@@ -7,7 +7,7 @@ import { readOnly, create, mutate, destructive } from "../../annotations.js";
 import { logAudit } from "../../audit-log.js";
 import { toolError } from "../../tool-error.js";
 import { toolResponse } from "../../tool-response.js";
-import { DEFAULT_LIABILITY_ACCOUNT } from "../../accounting-defaults.js";
+import { ROLE_FOR_CONSTANT, roleAccount } from "../../crm/role-map.js";
 import { applyListView, viewParam } from "../../list-views.js";
 import {
   applyPurchaseItemStructuralDefaults,
@@ -97,7 +97,7 @@ export function registerPurchaseInvoiceTools(server: McpServer, api: ApiContext)
       base_net_price: z.number().optional().describe("EUR equivalent of net_price; auto-derived from currency_rate when omitted."),
       base_vat_price: z.number().optional().describe("EUR equivalent of vat_price; auto-derived from currency_rate when omitted."),
       base_gross_price: z.number().optional().describe("Actual settled EUR gross total; auto-derived from currency_rate when omitted."),
-      liability_accounts_id: z.number().optional().describe("Liability account (default 2310)"),
+      liability_accounts_id: z.number().optional().describe("Liability account (default: the chart account with role `PAYABLE`)"),
       items: jsonObjectArrayInput.describe(
         "Items [{custom_title, cl_purchase_articles_id, purchase_accounts_id, purchase_accounts_dimensions_id?, total_net_price, amount, vat_rate_dropdown?, vat_accounts_id?, vat_accounts_dimensions_id?, cl_vat_articles_id?, project_no_vat_gross_price?, cl_fringe_benefits_id?}]. purchase_accounts_dimensions_id is REQUIRED when the expense account has dimensions; same for vat_accounts_dimensions_id on dimensioned VAT accounts."
       ),
@@ -149,6 +149,22 @@ export function registerPurchaseInvoiceTools(server: McpServer, api: ApiContext)
         });
       }
 
+      // F7 (Task 29): no hard-coded liability account. An explicit override
+      // wins; otherwise the chart account carrying the PAYABLE role. A missing
+      // role fails closed here, before any write, proposing create_account
+      // rather than guessing a fixed account number.
+      let liabilityAccountsId = params.liability_accounts_id;
+      if (liabilityAccountsId === undefined) {
+        const resolved = roleAccount(accounts, ROLE_FOR_CONSTANT.DEFAULT_LIABILITY_ACCOUNT);
+        if (typeof resolved !== "number") {
+          return toolError({
+            error: `No account with role \`${resolved.missing}\` exists in this company's chart.`,
+            hint: `Create the liability account with create_account (role \`${resolved.missing}\`), or pass liability_accounts_id explicitly.`,
+          });
+        }
+        liabilityAccountsId = resolved;
+      }
+
       const invoiceData: CreatePurchaseInvoiceData = {
         clients_id: params.clients_id,
         client_name,
@@ -161,7 +177,7 @@ export function registerPurchaseInvoiceTools(server: McpServer, api: ApiContext)
         base_net_price: params.base_net_price,
         base_vat_price: params.base_vat_price,
         base_gross_price: params.base_gross_price,
-        liability_accounts_id: params.liability_accounts_id ?? DEFAULT_LIABILITY_ACCOUNT,
+        liability_accounts_id: liabilityAccountsId,
         bank_ref_number: params.bank_ref_number,
         bank_account_no: params.bank_account_no,
         notes: tagNotes(params.notes),

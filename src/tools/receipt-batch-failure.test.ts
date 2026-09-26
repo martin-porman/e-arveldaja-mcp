@@ -951,12 +951,21 @@ describe("process_receipt_batch rollback handling", () => {
         invalidate: vi.fn().mockResolvedValue({}),
       },
       readonly: {
+        // F7: role-tagged so the PAYABLE role-based fallback (no more
+        // hard-coded DEFAULT_LIABILITY_ACCOUNT) resolves a liability account.
         getAccounts: vi.fn().mockResolvedValue([{
           id: 5230,
           name_est: "Software expense",
           name_eng: "Software expense",
           account_type_est: "Kulud",
           account_type_eng: "Expenses",
+        }, {
+          id: 2310,
+          name_est: "Tarnijate v\u00f5lgnevus",
+          name_eng: "Accounts payable",
+          account_type_est: "Kohustused",
+          account_type_eng: "Liabilities",
+          cl_account_groups: ["PAYABLE"],
         }]),
         getPurchaseArticles: vi.fn().mockResolvedValue([{
           id: 501,
@@ -1137,12 +1146,21 @@ describe("process_receipt_batch rollback handling", () => {
         invalidate: vi.fn().mockResolvedValue({}),
       },
       readonly: {
+        // F7: role-tagged so the PAYABLE role-based fallback (no more
+        // hard-coded DEFAULT_LIABILITY_ACCOUNT) resolves a liability account.
         getAccounts: vi.fn().mockResolvedValue([{
           id: 5230,
           name_est: "Software expense",
           name_eng: "Software expense",
           account_type_est: "Kulud",
           account_type_eng: "Expenses",
+        }, {
+          id: 2310,
+          name_est: "Tarnijate v\u00f5lgnevus",
+          name_eng: "Accounts payable",
+          account_type_est: "Kohustused",
+          account_type_eng: "Liabilities",
+          cl_account_groups: ["PAYABLE"],
         }]),
         getPurchaseArticles: vi.fn().mockResolvedValue([{
           id: 501,
@@ -1302,12 +1320,21 @@ describe("process_receipt_batch rollback handling", () => {
         invalidate: vi.fn().mockResolvedValue({}),
       },
       readonly: {
+        // F7: role-tagged so the PAYABLE role-based fallback (no more
+        // hard-coded DEFAULT_LIABILITY_ACCOUNT) resolves a liability account.
         getAccounts: vi.fn().mockResolvedValue([{
           id: 5230,
           name_est: "Software expense",
           name_eng: "Software expense",
           account_type_est: "Kulud",
           account_type_eng: "Expenses",
+        }, {
+          id: 2310,
+          name_est: "Tarnijate v\u00f5lgnevus",
+          name_eng: "Accounts payable",
+          account_type_est: "Kohustused",
+          account_type_eng: "Liabilities",
+          cl_account_groups: ["PAYABLE"],
         }]),
         getPurchaseArticles: vi.fn().mockResolvedValue([{
           id: 501,
@@ -1467,12 +1494,21 @@ describe("process_receipt_batch rollback handling", () => {
         confirmWithTotals: vi.fn().mockResolvedValue({}),
       },
       readonly: {
+        // F7: role-tagged so the PAYABLE role-based fallback (no more
+        // hard-coded DEFAULT_LIABILITY_ACCOUNT) resolves a liability account.
         getAccounts: vi.fn().mockResolvedValue([{
           id: 5230,
           name_est: "Software expense",
           name_eng: "Software expense",
           account_type_est: "Kulud",
           account_type_eng: "Expenses",
+        }, {
+          id: 2310,
+          name_est: "Tarnijate v\u00f5lgnevus",
+          name_eng: "Accounts payable",
+          account_type_est: "Kohustused",
+          account_type_eng: "Liabilities",
+          cl_account_groups: ["PAYABLE"],
         }]),
         getPurchaseArticles: vi.fn().mockResolvedValue([{
           id: 501,

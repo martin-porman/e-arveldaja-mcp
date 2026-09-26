@@ -96,6 +96,44 @@ let cachedRules: AccountingRules | undefined;
 let cachedRulesKey: string | undefined;
 let accountingRulesConnectionGetter = () => ({ name: "default", stableIdentity: "default" });
 
+// ---- F6: learned rules live in the CRM (Task 29) --------------------------
+//
+// A third storage mode alongside `file`/`bundle`: when `CRM_API_URL` is set,
+// auto-booking rules are hydrated from the CRM's `GET /rules` before the
+// server connects (mirrors F2) and written back through the same queued sink
+// as the fork's other CRM-backed stores (`src/crm/persistence.ts`). Only
+// `approved` rules are used by `suggest_booking`/`findAutoBookingRule`;
+// `pending` and `rejected` snapshot entries are retained (so a later
+// `initCrmRules` refresh does not need to know about them) but never matched.
+
+export type CrmRuleStatus = "approved" | "pending" | "rejected";
+export interface CrmRuleEntry {
+  key: string;
+  status: CrmRuleStatus;
+  rule: AccountingAutoBookingRule;
+}
+export interface CrmRulesSink {
+  save(key: string, rule: AccountingAutoBookingRule): void;
+  flush(): Promise<void>;
+}
+
+let crmRulesSnapshot: CrmRuleEntry[] | undefined;
+let crmRulesSink: CrmRulesSink | undefined;
+let crmRulesGeneration = 0;
+
+/**
+ * Hydrate the crm-mode rules store from the CRM's approved/pending/rejected
+ * snapshot and bind the sink `saveAutoBookingRule` writes new rules through.
+ * Call once at connect time when `CRM_API_URL` is set (the boot wiring is
+ * outside this file — see OUTPUT).
+ */
+export function initCrmRules(snapshot: CrmRuleEntry[], sink: CrmRulesSink): void {
+  crmRulesSnapshot = snapshot;
+  crmRulesSink = sink;
+  crmRulesGeneration += 1;
+  resetAccountingRulesCache();
+}
+
 const AUTO_BOOKING_RULE_ACTION_FIELDS = [
   "purchase_article_id",
   "purchase_account_id",
@@ -117,10 +155,13 @@ const OKF_VERSION = "0.1";
  * - `bundle` mode (default): an Open Knowledge Format (OKF) v0.1 directory of
  *   concept files. `legacyFile` is the sibling single file that is read as a
  *   fallback and migrated into the bundle on first write.
+ * - `crm` mode: `CRM_API_URL` is set. Auto-booking rules live in the CRM
+ *   (`initCrmRules`); there is no local file or bundle directory.
  */
 type RulesStorage =
   | { mode: "file"; file: string }
-  | { mode: "bundle"; dir: string; legacyFile: string };
+  | { mode: "bundle"; dir: string; legacyFile: string }
+  | { mode: "crm" };
 
 function resolveAbsolute(value: string): string {
   return isAbsolute(value) ? value : resolve(process.cwd(), value);
@@ -135,6 +176,9 @@ function resolveStorage(): RulesStorage {
   if (configuredDir) {
     const dir = resolveAbsolute(configuredDir);
     return { mode: "bundle", dir, legacyFile: resolve(dirname(dir), LEGACY_FILE_NAME) };
+  }
+  if (process.env.CRM_API_URL?.trim()) {
+    return { mode: "crm" };
   }
   let connection: { name: string; stableIdentity: string };
   try {
@@ -524,7 +568,7 @@ Optional account overrides table:
 ## Annual Report
 
 If your chart of accounts uses a custom current-year profit/loss account, add a plain text line under Annual Report:
-- \`Current year profit account: 2970\`
+- Current year profit account: the account with role \`CURRENT_YEAR_RESULT\` (create it with \`create_account\` if the chart has none)
 
 ## Liability Classification
 
@@ -782,13 +826,38 @@ function safeLoadBundle(dir: string): AccountingRules {
   }
 }
 
-function loadAccountingRules(): AccountingRules {
+/**
+ * Only `approved` CRM-snapshot rules are live for booking; `pending` and
+ * `rejected` entries are retained in the snapshot (so a later save/refresh
+ * does not lose them) but never matched by `findAutoBookingRule`. An
+ * unhydrated crm mode (no `initCrmRules` call yet) is not an error — it reads
+ * as no rules, once, with a warning, mirroring the other F2-style stores.
+ */
+let warnedUnhydratedCrmRules = false;
+function buildCrmRules(): AccountingRules {
+  if (!crmRulesSnapshot) {
+    if (!warnedUnhydratedCrmRules) {
+      warnedUnhydratedCrmRules = true;
+      process.stderr.write("WARNING: CRM_API_URL is set but initCrmRules() has not been called yet; accounting rules read as empty.\n");
+    }
+    return {};
+  }
+  const counterparties = crmRulesSnapshot
+    .filter(entry => entry.status === "approved")
+    .map(entry => entry.rule);
+  return counterparties.length > 0 ? { auto_booking: { counterparties } } : {};
+}
+
+export function loadAccountingRules(): AccountingRules {
   const storage = resolveStorage();
   let key: string;
   let produce: () => AccountingRules;
   if (storage.mode === "file") {
     key = `file:${getRulesSignature(storage.file)}`;
     produce = () => (existsSync(storage.file) ? safeParseLegacyFile(storage.file) : {});
+  } else if (storage.mode === "crm") {
+    key = `crm:${crmRulesGeneration}`;
+    produce = buildCrmRules;
   } else if (bundleHasConcepts(storage.dir)) {
     key = `bundle:${getBundleSignature(storage.dir)}`;
     produce = () => safeLoadBundle(storage.dir);
@@ -818,6 +887,7 @@ export function resetAccountingRulesCache(): void {
 export function getAccountingRulesPath(): string {
   const storage = resolveStorage();
   if (storage.mode === "file") return storage.file;
+  if (storage.mode === "crm") return "crm:rules";
   if (bundleHasConcepts(storage.dir)) return storage.dir;
   if (existsSync(storage.legacyFile)) return storage.legacyFile;
   return storage.dir;
@@ -825,13 +895,13 @@ export function getAccountingRulesPath(): string {
 
 export function resolveOpeningBalanceStorePath(): string | null {
   const storage = resolveStorage();
-  if (storage.mode === "file") return null;           // single-file legacy mode has no bundle dir
+  if (storage.mode === "file" || storage.mode === "crm") return null; // no local bundle dir
   return resolve(storage.dir, "opening-balances.json");
 }
 
 export function resolveStatementBalanceStorePath(): string | null {
   const storage = resolveStorage();
-  if (storage.mode === "file") return null;           // single-file legacy mode has no bundle dir
+  if (storage.mode === "file" || storage.mode === "crm") return null; // no local bundle dir
   return resolve(storage.dir, "statement-balances.json");
 }
 
@@ -919,10 +989,50 @@ export function saveAutoBookingRule(rawInput: SaveAutoBookingRuleInput): {
   if (!parsed.success) {
     throw new Error(parsed.error.issues.map(issue => issue.message).join("; "));
   }
+  if (storage.mode === "crm") {
+    return saveAutoBookingRuleToCrm(parsed.data);
+  }
   return withBundleLock(storage.dir, () => {
     ensureBundle(storage.dir, storage.legacyFile);
     return saveAutoBookingRuleToBundle(parsed.data, storage.dir);
   });
+}
+
+/**
+ * F6: a saved rule is written to the CRM as `pending` — it is listed but not
+ * used by `findAutoBookingRule`/`suggest_booking` until the CRM approves it
+ * (spec §4.4 L2). Requires `initCrmRules()` to have bound a sink first; a
+ * crm-mode save before that boot wiring runs fails loudly rather than
+ * silently discarding the rule.
+ */
+function saveAutoBookingRuleToCrm(rule: AccountingAutoBookingRule): {
+  path: string;
+  action: "inserted" | "updated";
+  match: string;
+  category?: string;
+} {
+  if (!crmRulesSink) {
+    throw new Error("CRM rules sink not initialised — call initCrmRules() before saving accounting rules in crm mode.");
+  }
+  const key = `auto:${normalizeAutoBookingRuleMatch(rule.match)}`;
+  const snapshot = crmRulesSnapshot ?? [];
+  const existingIndex = snapshot.findIndex(entry => entry.key === key);
+  const entry: CrmRuleEntry = { key, status: "pending", rule };
+  if (existingIndex >= 0) {
+    snapshot[existingIndex] = entry;
+  } else {
+    snapshot.push(entry);
+  }
+  crmRulesSnapshot = snapshot;
+  crmRulesGeneration += 1;
+  resetAccountingRulesCache();
+  crmRulesSink.save(key, rule);
+  return {
+    path: `crm:rules/${key}`,
+    action: existingIndex >= 0 ? "updated" : "inserted",
+    match: rule.match,
+    category: rule.category,
+  };
 }
 
 function legacySaveAutoBookingRule(input: SaveAutoBookingRuleInput, path: string): {
@@ -1763,6 +1873,12 @@ function accountingKnowledgeConceptUri(rel: string): string {
 /** Lists the knowledge bundle for browsing as MCP resources. Read-only. */
 export function getAccountingKnowledgeOverview(): AccountingKnowledgeOverview {
   const storage = resolveStorage();
+
+  // crm mode has no local bundle/legacy file to browse — auto-booking rules
+  // live in the CRM (F6); this resource surface stays empty for it.
+  if (storage.mode === "crm") {
+    return { mode: "empty", root: "crm:rules", indexMarkdown: EMPTY_KNOWLEDGE_NOTE, concepts: [] };
+  }
 
   // Use the same authoritative test as loadAccountingRules()/getAccountingRulesPath():
   // a reserved-only bundle (index/log, no concepts) must NOT be surfaced as the

@@ -68,10 +68,10 @@ describe("applyPurchaseVatDefaults", () => {
     expect(result.amount).toBe(5);
   });
 
-  it("uses fallback VAT defaults for VAT-registered companies", () => {
+  it("F7: leaves vat_accounts_id unset (no hard-coded fallback account) when purchase_articles carry no VAT default, but still defaults cl_vat_articles_id", () => {
     const item = { custom_title: "test", cl_purchase_articles_id: 1 } as PurchaseInvoiceItem;
     const result = applyPurchaseVatDefaults(emptyArticles, item, true);
-    expect(result.vat_accounts_id).toBe(1510);
+    expect(result.vat_accounts_id).toBeUndefined();
     expect(result.cl_vat_articles_id).toBe(1);
   });
 

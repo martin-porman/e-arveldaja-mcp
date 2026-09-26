@@ -1,7 +1,7 @@
 import { logAudit } from "../audit-log.js";
 import { wrapUntrustedOcr } from "../mcp-json.js";
 import { checkIntakeCashDuplicates, formatDuplicatePostingWarnings } from "../bank-posting-duplicate-guard.js";
-import { DEFAULT_LIABILITY_ACCOUNT } from "../accounting-defaults.js";
+import { ROLE_FOR_CONSTANT, roleAccount } from "../crm/role-map.js";
 import { roundMoney } from "../money.js";
 import { isProjectTransaction } from "../transaction-status.js";
 import type { PurchaseInvoice, PurchaseInvoiceItem, Transaction } from "../types/api.js";
@@ -203,6 +203,21 @@ export async function createAndMaybeMatchPurchaseInvoice(
     notes.push('Legacy execute=true maps to execution_mode="create"; invoice will be created and uploaded but left unconfirmed (#19).');
   }
 
+  // F7 (Task 29): no hard-coded liability account. An explicit booking
+  // suggestion wins; otherwise the chart account carrying the PAYABLE role.
+  // A missing role stops the auto-create and asks for manual review instead
+  // of guessing a fixed account number.
+  let liabilityAccountId = bookingSuggestion.suggested_liability_account_id;
+  if (liabilityAccountId === undefined) {
+    const resolved = roleAccount(context.accounts, ROLE_FOR_CONSTANT.DEFAULT_LIABILITY_ACCOUNT);
+    if (typeof resolved === "number") {
+      liabilityAccountId = resolved;
+    } else {
+      notes.push(`No account with role \`${resolved.missing}\` exists in this company's chart — propose create_account (role \`${resolved.missing}\`) or set the liability account manually.`);
+      return { notes, status: "needs_review" };
+    }
+  }
+
   let createdInvoice: PurchaseInvoice;
   try {
     createdInvoice = await api.purchaseInvoices.createAndSetTotals(
@@ -214,7 +229,7 @@ export async function createAndMaybeMatchPurchaseInvoice(
         journal_date: extracted.invoice_date,
         term_days: computeTermDays(extracted.invoice_date, extracted.due_date),
         cl_currencies_id: invoiceCurrency,
-        liability_accounts_id: bookingSuggestion.suggested_liability_account_id ?? DEFAULT_LIABILITY_ACCOUNT,
+        liability_accounts_id: liabilityAccountId,
         bank_ref_number: extracted.ref_number,
         bank_account_no: extracted.supplier_iban,
         notes: tagNotes(invoiceNotes),

@@ -39,7 +39,7 @@ import {
 import { getAllowedRootsStartupWarning } from "../file-validation.js";
 import { initAuditLog, logAudit } from "../audit-log.js";
 import { serializeToolMutationError } from "../mutation-audit.js";
-import { initAccountingRulesConnection } from "../accounting-rules.js";
+import { initAccountingRulesConnection, initCrmRules, type AccountingAutoBookingRule, type CrmRuleEntry, type CrmRuleStatus } from "../accounting-rules.js";
 import { createPublicToolRegistrar } from "../public-tool-registrar.js";
 import { exposureForProfile, type ToolProfile } from "../tool-profile.js";
 import { buildServerInstructions } from "./server-instructions.js";
@@ -203,6 +203,53 @@ function isPlainRawShape(schema: unknown): schema is Record<string, unknown> {
   return typeof schema === "object" && schema !== null && !Array.isArray(schema) && !("_def" in schema) && !("_zod" in schema);
 }
 
+interface CrmRuleRow {
+  key: string;
+  status: string;
+  rule: unknown;
+}
+
+/**
+ * F6 (Task 29, spec §4.4): hydrate the fork's learned auto-booking rules from
+ * the CRM's `GET /rules` (Task 21's route, scope `prepare`) before the server
+ * can accept a tool call — mirrors the plan/workflow-state/file-ref/
+ * operation-result hydration just above via the same persistence client. An
+ * unrecognized status defensively reads as `pending` (listed, never used for
+ * booking) rather than `approved`, so a schema drift on the CRM side can never
+ * silently promote a rule.
+ */
+async function fetchCrmRulesSnapshot(client: HttpClient): Promise<CrmRuleEntry[]> {
+  const response = await client.get<{ rules: CrmRuleRow[] }>("/rules");
+  return response.rules.map((row): CrmRuleEntry => ({
+    key: row.key,
+    status: row.status === "approved" || row.status === "rejected" ? row.status : ("pending" as CrmRuleStatus),
+    rule: row.rule as AccountingAutoBookingRule,
+  }));
+}
+
+/**
+ * F6: the sink `saveAutoBookingRule` writes a new/updated rule through in crm
+ * mode — `PUT /rules/:key`, always `pending` server-side (Task 21's route
+ * upsert). `judgmentIds` is required by that route's body validation; the
+ * fork's `save_auto_booking_rule` tool carries no judgment ids today, so an
+ * empty array is sent (the CRM still records the rule as pending).
+ */
+function crmRulesSink(client: HttpClient): { save(key: string, rule: AccountingAutoBookingRule): void; flush(): Promise<void> } {
+  let pending: Promise<void> = Promise.resolve();
+  return {
+    save(key, rule) {
+      pending = pending
+        .then(() => client.put(`/rules/${encodeURIComponent(key)}`, { rule, judgmentIds: [] }))
+        .then(() => undefined);
+    },
+    async flush() {
+      const outstanding = pending;
+      pending = Promise.resolve();
+      await outstanding;
+    },
+  };
+}
+
 export interface McpBootstrapOptions {
   /** Explicit configs bypass environment and filesystem discovery; [] selects setup mode. */
   configs?: readonly NamedConfig[];
@@ -332,13 +379,21 @@ export async function createMcpServer(
   if (crmConnection) {
     const persistenceClient = new HttpClient(crmConnection.config, "fork-persistence");
     persistenceSink = crmPersistence(persistenceClient);
-    [planRecords, workflowRecords, fileRefRecords, operationResultRecords, identity] = await Promise.all([
+    let rulesSnapshot: CrmRuleEntry[];
+    [planRecords, workflowRecords, fileRefRecords, operationResultRecords, identity, rulesSnapshot] = await Promise.all([
       persistenceSink.load("plans"),
       persistenceSink.load("workflow_states"),
       persistenceSink.load("file_refs"),
       persistenceSink.load("operation_results"),
       fetchIdentity(persistenceClient),
+      fetchCrmRulesSnapshot(persistenceClient),
     ]);
+    // F6 (Task 29): learned auto-booking rules live in the CRM. Hydrate the
+    // approved/pending/rejected snapshot now and bind the save-through sink,
+    // reusing the same persistence client (same base URL/credentials as
+    // fork/state/* and /judgments) since `rules` is a sibling top-level CRM
+    // route, not nested under `fork/`.
+    initCrmRules(rulesSnapshot, crmRulesSink(persistenceClient));
     // Task 27: the fork's only judgments write path. Reuses the same
     // persistence client (same base URL/credentials as fork/state/*) since
     // `judgments` is a sibling top-level CRM route, not nested under `fork/`.

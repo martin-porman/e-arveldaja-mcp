@@ -37,7 +37,7 @@ import { applyPurchaseVatDefaults, getPurchaseArticlesWithVat } from "../tools/p
 import { validateItemDimensions } from "../account-validation.js";
 import { isCompanyVatRegistered, parsePurchaseInvoiceItems, tagNotes } from "../tools/crud-tools.js";
 import { InvoiceCreationError } from "../api/purchase-invoices.api.js";
-import { DEFAULT_LIABILITY_ACCOUNT } from "../accounting-defaults.js";
+import { ROLE_FOR_CONSTANT, roleAccount } from "../crm/role-map.js";
 import { logAudit } from "../audit-log.js";
 import { desandboxAllStrings, desandboxText } from "../external-text-renderer.js";
 import { canonicalPlanJson, stripUndefinedDeep } from "../tools/camt-plan.js";
@@ -192,7 +192,24 @@ class AccountingDocumentOperationsImpl implements AccountingDocumentOperations {
     const refNumber = booking.refNumber === undefined ? undefined : desandboxText(booking.refNumber);
     const bankAccountNo = booking.bankAccountNo === undefined ? undefined : desandboxText(booking.bankAccountNo);
     const notes = booking.notes === undefined ? undefined : desandboxText(booking.notes);
-    const liabilityAccountsId = booking.liabilityAccountsId ?? DEFAULT_LIABILITY_ACCOUNT;
+    // F7 (Task 29): no hard-coded liability account. An explicit override
+    // wins; otherwise the chart account carrying the PAYABLE role. A missing
+    // role fails closed here, before any account/dimension write, proposing
+    // create_account rather than guessing a fixed account number.
+    let liabilityAccountsId: number;
+    if (booking.liabilityAccountsId !== undefined) {
+      liabilityAccountsId = booking.liabilityAccountsId;
+    } else {
+      const resolved = roleAccount(accounts, ROLE_FOR_CONSTANT.DEFAULT_LIABILITY_ACCOUNT);
+      if (typeof resolved !== "number") {
+        return fail(
+          "account_validation_failed",
+          `No account with role \`${resolved.missing}\` exists in this company's chart. Create it with create_account (role \`${resolved.missing}\`), or pass liabilityAccountsId explicitly.`,
+          "never",
+        );
+      }
+      liabilityAccountsId = resolved;
+    }
     const blockOnDuplicate = booking.blockOnDuplicate === true;
     // The actual settled EUR gross when known, else the nominal gross only for
     // an EUR-native invoice — never a guessed conversion.

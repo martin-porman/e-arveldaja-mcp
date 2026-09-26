@@ -89,7 +89,7 @@ describe("process_accounting_document", () => {
     const { handler } = setup({
       clientRows: [supplier()],
       purchaseInvoiceRows: [],
-      accounts: [fixtureAccount({ id: 5000, name_est: "Teenused" }), fixtureAccount({ id: 1510, name_est: "Sisendkm", is_vat_account: true })],
+      accounts: [fixtureAccount({ id: 5000, name_est: "Teenused" }), fixtureAccount({ id: 1510, name_est: "Sisendkm", is_vat_account: true }), fixtureAccount({ id: 2310, name_est: "Tarnijate võlgnevus", cl_account_groups: ["PAYABLE"] })],
       clients: {
         get: vi.fn().mockResolvedValue(supplier()),
         listAll: vi.fn().mockRejectedValue(new Error("clients.listAll 503")),
@@ -129,7 +129,7 @@ describe("process_accounting_document", () => {
     const { handler } = setup({
       clientRows: [supplier()],
       purchaseInvoiceRows: [],
-      accounts: [fixtureAccount({ id: 5000, name_est: "Teenused" }), fixtureAccount({ id: 1510, name_est: "Sisendkm", is_vat_account: true })],
+      accounts: [fixtureAccount({ id: 5000, name_est: "Teenused" }), fixtureAccount({ id: 1510, name_est: "Sisendkm", is_vat_account: true }), fixtureAccount({ id: 2310, name_est: "Tarnijate võlgnevus", cl_account_groups: ["PAYABLE"] })],
       clients: { get: vi.fn().mockResolvedValue(supplier()) },
     });
     const result = await handler({ mode: "prepare", file_path: path, ...bookingArgs() });
@@ -214,7 +214,7 @@ describe("process_accounting_document", () => {
     const { path, sha256 } = writeTempPdf();
     const { handler, api } = setup({
       clientRows: [supplier()],
-      accounts: [fixtureAccount({ id: 5000, name_est: "Teenused" }), fixtureAccount({ id: 1510, name_est: "Sisendkm", is_vat_account: true })],
+      accounts: [fixtureAccount({ id: 5000, name_est: "Teenused" }), fixtureAccount({ id: 1510, name_est: "Sisendkm", is_vat_account: true }), fixtureAccount({ id: 2310, name_est: "Tarnijate võlgnevus", cl_account_groups: ["PAYABLE"] })],
       clients: { get: vi.fn().mockResolvedValue(supplier()) },
       purchaseInvoices: {
         listAll: vi.fn().mockResolvedValue([]),
@@ -249,7 +249,7 @@ describe("process_accounting_document", () => {
     const { path, sha256 } = writeTempPdf();
     const { handler, api } = setup({
       clientRows: [supplier()],
-      accounts: [fixtureAccount({ id: 5000, name_est: "Teenused" }), fixtureAccount({ id: 1510, name_est: "Sisendkm", is_vat_account: true })],
+      accounts: [fixtureAccount({ id: 5000, name_est: "Teenused" }), fixtureAccount({ id: 1510, name_est: "Sisendkm", is_vat_account: true }), fixtureAccount({ id: 2310, name_est: "Tarnijate võlgnevus", cl_account_groups: ["PAYABLE"] })],
       clients: { get: vi.fn().mockResolvedValue(supplier()) },
       purchaseInvoices: {
         listAll: vi.fn().mockResolvedValue([]),
@@ -281,7 +281,7 @@ describe("process_accounting_document", () => {
     const DUP_JOURNAL_ID = 555;
     const { handler } = setup({
       clientRows: [supplier()],
-      accounts: [fixtureAccount({ id: 5000, name_est: "Teenused" }), fixtureAccount({ id: 1510, name_est: "Sisendkm", is_vat_account: true })],
+      accounts: [fixtureAccount({ id: 5000, name_est: "Teenused" }), fixtureAccount({ id: 1510, name_est: "Sisendkm", is_vat_account: true }), fixtureAccount({ id: 2310, name_est: "Tarnijate võlgnevus", cl_account_groups: ["PAYABLE"] })],
       clients: { get: vi.fn().mockResolvedValue(supplier()) },
       bankAccounts: [{ account_name_est: "LHV", account_no: "1", accounts_dimensions_id: 5001 }],
       accountDimensions: [{ id: 5001, accounts_id: 1020, title_est: "LHV EUR" }],
@@ -343,7 +343,7 @@ describe("process_accounting_document", () => {
   function confirmCapableSetup() {
     return setup({
       clientRows: [supplier()],
-      accounts: [fixtureAccount({ id: 5000, name_est: "Teenused" }), fixtureAccount({ id: 1510, name_est: "Sisendkm", is_vat_account: true })],
+      accounts: [fixtureAccount({ id: 5000, name_est: "Teenused" }), fixtureAccount({ id: 1510, name_est: "Sisendkm", is_vat_account: true }), fixtureAccount({ id: 2310, name_est: "Tarnijate võlgnevus", cl_account_groups: ["PAYABLE"] })],
       clients: { get: vi.fn().mockResolvedValue(supplier()) },
       purchaseInvoices: {
         listAll: vi.fn().mockResolvedValue([]),
@@ -383,7 +383,7 @@ describe("process_accounting_document", () => {
     );
     const { handler } = setup({
       clientRows: [supplier()],
-      accounts: [fixtureAccount({ id: 5000, name_est: "Teenused" }), fixtureAccount({ id: 1510, name_est: "Sisendkm", is_vat_account: true })],
+      accounts: [fixtureAccount({ id: 5000, name_est: "Teenused" }), fixtureAccount({ id: 1510, name_est: "Sisendkm", is_vat_account: true }), fixtureAccount({ id: 2310, name_est: "Tarnijate võlgnevus", cl_account_groups: ["PAYABLE"] })],
       clients: { get: vi.fn().mockResolvedValue(supplier()) },
       purchaseInvoices: {
         listAll: vi.fn().mockResolvedValue([]),
@@ -463,7 +463,7 @@ describe("process_accounting_document", () => {
     const { path, sha256 } = writeTempPdf();
     const { handler } = setup({
       clientRows: [supplier()],
-      accounts: [fixtureAccount({ id: 5000, name_est: "Teenused" }), fixtureAccount({ id: 1510, name_est: "Sisendkm", is_vat_account: true })],
+      accounts: [fixtureAccount({ id: 5000, name_est: "Teenused" }), fixtureAccount({ id: 1510, name_est: "Sisendkm", is_vat_account: true }), fixtureAccount({ id: 2310, name_est: "Tarnijate võlgnevus", cl_account_groups: ["PAYABLE"] })],
       clients: { get: vi.fn().mockResolvedValue(supplier()) },
       purchaseInvoices: {
         listAll: vi.fn().mockResolvedValue([]),
@@ -494,7 +494,7 @@ describe("process_accounting_document", () => {
     const { path, sha256 } = writeTempPdf();
     const { handler } = setup({
       clientRows: [supplier()],
-      accounts: [fixtureAccount({ id: 5000, name_est: "Teenused" }), fixtureAccount({ id: 1510, name_est: "Sisendkm", is_vat_account: true })],
+      accounts: [fixtureAccount({ id: 5000, name_est: "Teenused" }), fixtureAccount({ id: 1510, name_est: "Sisendkm", is_vat_account: true }), fixtureAccount({ id: 2310, name_est: "Tarnijate võlgnevus", cl_account_groups: ["PAYABLE"] })],
       clients: { get: vi.fn().mockResolvedValue(supplier()) },
       purchaseInvoices: {
         listAll: vi.fn().mockResolvedValue([]),
@@ -520,7 +520,7 @@ describe("process_accounting_document", () => {
   function confirmSetupWithReadback(readback: Record<string, unknown>) {
     return setup({
       clientRows: [supplier()],
-      accounts: [fixtureAccount({ id: 5000, name_est: "Teenused" }), fixtureAccount({ id: 1510, name_est: "Sisendkm", is_vat_account: true })],
+      accounts: [fixtureAccount({ id: 5000, name_est: "Teenused" }), fixtureAccount({ id: 1510, name_est: "Sisendkm", is_vat_account: true }), fixtureAccount({ id: 2310, name_est: "Tarnijate võlgnevus", cl_account_groups: ["PAYABLE"] })],
       clients: { get: vi.fn().mockResolvedValue(supplier()) },
       purchaseInvoices: {
         listAll: vi.fn().mockResolvedValue([]),

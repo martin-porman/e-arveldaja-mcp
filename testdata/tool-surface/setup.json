@@ -2,12 +2,12 @@
   "profile": "setup",
   "measurement": {
     "toolCount": 130,
-    "toolsListBytes": 126186,
+    "toolsListBytes": 126369,
     "descriptionsBytes": 16565,
-    "inputSchemasBytes": 78308,
+    "inputSchemasBytes": 78491,
     "largestTool": {
       "name": "create_purchase_invoice_from_pdf",
-      "bytes": 3627
+      "bytes": 3661
     },
     "serverInstructionsBytes": 769,
     "promptMetadataBytes": 11072,
@@ -2357,7 +2357,7 @@
             "type": "string"
           },
           "liability_accounts_id": {
-            "description": "Liability account (default 2310)",
+            "description": "Liability account (default: the chart account with role `PAYABLE`)",
             "type": "number"
           },
           "notes": {
@@ -3608,7 +3608,7 @@
             "type": "string"
           },
           "liability_accounts_id": {
-            "description": "Liability account (default 2310)",
+            "description": "Liability account (default: the chart account with role `PAYABLE`)",
             "type": "number"
           },
           "notes": {
@@ -4274,11 +4274,11 @@
             "type": "integer"
           },
           "payable_account": {
-            "description": "Payable to owner account (default 2110)",
+            "description": "Payable to owner account (default: the chart account with role `OWNER_PAYABLE`)",
             "type": "number"
           },
           "vat_account": {
-            "description": "Input VAT account (default 1510)",
+            "description": "Input VAT account (default: the chart account with role `VAT_INPUT`, when a deductible-VAT posting is made)",
             "type": "number"
           },
           "vat_amount": {

@@ -3004,7 +3004,9 @@ ${entryXml}
     expect(payload.suggested_tools).not.toContain("create_owner_expense_reimbursement");
     expect(payload.next_step_summary).not.toContain("create_owner_expense_reimbursement");
     expect(payload.next_step_summary).toContain("create_journal");
-    expect(payload.next_step_summary).toContain("2110");
+    // F7: no more hard-coded account number in this message — it names the
+    // chart role instead (no hard-coded accounts).
+    expect(payload.next_step_summary).toContain("role `OWNER_PAYABLE`");
   });
 
   it("guided resolve_review also blocks the create_journal tax-disabled fallback", async () => {
@@ -3031,7 +3033,9 @@ ${entryXml}
 
   const ownerExpenseBookingAccounts = [
     { id: 5000, name_est: "Kulud", name_eng: "Expenses" },
-    { id: 2110, name_est: "Võlg omanikule", name_eng: "Owner payable" },
+    // F7: role-tagged so the OWNER_PAYABLE role-based fallback (no more
+    // hard-coded DEFAULT_OWNER_PAYABLE_ACCOUNT) resolves to this account.
+    { id: 2110, name_est: "Võlg omanikule", name_eng: "Owner payable", cl_account_groups: ["OWNER_PAYABLE"] },
   ] as any;
 
   function ownerExpenseBookingItem(overrides: Record<string, unknown> = {}) {
@@ -3252,11 +3256,15 @@ ${entryXml}
 
   // Chart with a VAT account so a VAT-registered owner expense resolves a
   // deductible-VAT posting; the mock company is VAT-registered by default.
+  // F7: only the "default" accounts (2110, 1510) carry the OWNER_PAYABLE/
+  // VAT_INPUT roles — the "2"/"2 2" siblings stay untagged so the explicit
+  // payable_account/vat_account override tests below still pick them by id,
+  // never by role (there is exactly one role holder per role here).
   const ownerExpenseVatAccounts = [
     { id: 5000, name_est: "Kulud", name_eng: "Expenses" },
-    { id: 2110, name_est: "Võlg omanikule", name_eng: "Owner payable" },
+    { id: 2110, name_est: "Võlg omanikule", name_eng: "Owner payable", cl_account_groups: ["OWNER_PAYABLE"] },
     { id: 2115, name_est: "Võlg omanikule 2", name_eng: "Owner payable 2" },
-    { id: 1510, name_est: "Sisendkäibemaks", name_eng: "Input VAT" },
+    { id: 1510, name_est: "Sisendkäibemaks", name_eng: "Input VAT", cl_account_groups: ["VAT_INPUT"] },
     { id: 1515, name_est: "Sisendkäibemaks 2", name_eng: "Input VAT 2" },
   ] as any;
 

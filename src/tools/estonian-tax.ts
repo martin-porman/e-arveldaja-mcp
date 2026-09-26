@@ -28,7 +28,8 @@ import { computeAccountBalance } from "./account-balance.js";
 import { withOpeningBalanceStatus } from "../opening-balance-limitations.js";
 import { loadOpeningBalanceJournal } from "../opening-balance-journal.js";
 import { BookingGuard, formatDocNumber, type DocKey } from "../booking-guard.js";
-import { INCOME_TAX_EXPENSE_ACCOUNT, DEFAULT_VAT_ACCOUNT, DEFAULT_OWNER_PAYABLE_ACCOUNT } from "../accounting-defaults.js";
+import { INCOME_TAX_EXPENSE_ACCOUNT } from "../accounting-defaults.js";
+import { ROLE_FOR_CONSTANT, roleAccount } from "../crm/role-map.js";
 import {
   resolveRestrictedReserveAccounts,
   resolveRetainedEarningsAccount,
@@ -245,14 +246,29 @@ export async function computeOwnerExpenseJournalProjection(
     return { ok: false, error: toolError({ error: `deductible_vat_amount must not be negative (got ${deductible_vat_amount}).` }) };
   }
   const vatRegistered = await isCompanyVatRegistered(api);
-  const vatAcc = vat_account ?? DEFAULT_VAT_ACCOUNT;
-  const payAcc = payable_account ?? DEFAULT_OWNER_PAYABLE_ACCOUNT;
   // Round the gross VAT whether it came from vat_rate or was supplied
   // directly: an unrounded caller vat_amount would otherwise be posted
   // verbatim while the balance guard below rounds only the sum, letting a
   // sub-cent-unbalanced journal reach the API.
   const grossVat = roundMoney(vat_amount ?? net_amount * vat_rate);
   const accounts = await api.readonly.getAccounts();
+  // F7 (Task 29): no hard-coded owner-payable account. An explicit override
+  // always wins; otherwise the chart account carrying the OWNER_PAYABLE role.
+  // A missing role is surfaced as an error proposing create_account, never
+  // guessed as a fixed account number.
+  let payAcc: number;
+  if (payable_account !== undefined) {
+    payAcc = payable_account;
+  } else {
+    const resolved = roleAccount(accounts, ROLE_FOR_CONSTANT.DEFAULT_OWNER_PAYABLE_ACCOUNT);
+    if (typeof resolved !== "number") {
+      return { ok: false, error: toolError({
+        error: `No account with role \`${resolved.missing}\` exists in this company's chart.`,
+        hint: `Create the owner-payable account with create_account (role \`${resolved.missing}\`), or pass payable_account explicitly.`,
+      }) };
+    }
+    payAcc = resolved;
+  }
   const expenseAccountRecord = accounts.find(account => account.id === expense_account);
   const requiresReview = requiresOwnerExpenseVatReview(expenseAccountRecord?.name_est ?? expenseAccountRecord?.name_eng, description);
   const configuredMode = getOwnerExpenseVatDeductionModeForAccount(expense_account) ?? getDefaultOwnerExpenseVatDeductionMode();
@@ -330,10 +346,25 @@ export async function computeOwnerExpenseJournalProjection(
 
   const deductibleVatPosted = deductibleVat > 0 && vatRegistered;
 
+  // F7: resolve the VAT_INPUT-role account only when a deductible-VAT posting
+  // is actually made — a non-VAT-deductible reimbursement must not be blocked
+  // by a chart that has no VAT_INPUT role yet. No hard-coded fallback number.
+  let vatAcc: number | undefined = vat_account;
+  if (deductibleVatPosted && vatAcc === undefined) {
+    const resolved = roleAccount(accounts, ROLE_FOR_CONSTANT.DEFAULT_VAT_ACCOUNT);
+    if (typeof resolved !== "number") {
+      return { ok: false, error: toolError({
+        error: `No account with role \`${resolved.missing}\` exists in this company's chart.`,
+        hint: `Create the input-VAT account with create_account (role \`${resolved.missing}\`), or pass vat_account explicitly.`,
+      }) };
+    }
+    vatAcc = resolved;
+  }
+
   // Validate all accounts exist
   const accountErrors = validateAccounts(accounts, [
     { id: expense_account, label: "Expense account" },
-    ...(deductibleVatPosted ? [{ id: vatAcc, label: "VAT account" }] : []),
+    ...(deductibleVatPosted ? [{ id: vatAcc!, label: "VAT account" }] : []),
     { id: payAcc, label: "Payable account" },
   ]);
   if (accountErrors.length > 0) {
@@ -371,7 +402,7 @@ export async function computeOwnerExpenseJournalProjection(
     { side: "D", account_id: expense_account, dimension_id: null, amount: expenseDebit, purpose: "expense" },
   ];
   if (deductibleVatPosted) {
-    postings.push({ side: "D", account_id: vatAcc, dimension_id: null, amount: deductibleVat, purpose: "deductible_vat" });
+    postings.push({ side: "D", account_id: vatAcc!, dimension_id: null, amount: deductibleVat, purpose: "deductible_vat" });
   }
   postings.push({ side: "C", account_id: payAcc, dimension_id: null, amount: total, purpose: "owner_payable" });
 
@@ -390,7 +421,7 @@ export async function computeOwnerExpenseJournalProjection(
     non_deductible_vat_amount: nonDeductibleVat,
     expense_account,
     expense_debit_amount: expenseDebit,
-    vat_account: deductibleVatPosted ? vatAcc : null,
+    vat_account: deductibleVatPosted ? vatAcc! : null,
     payable_account: payAcc,
     total,
     vat_registered: vatRegistered,
@@ -996,8 +1027,8 @@ export function registerEstonianTaxTools(server: McpServer, api: ApiContext): vo
       vat_deduction_mode: z.enum(["none", "full", "partial"]).optional().describe("VAT deduction mode. Use partial with deductible_vat_amount."),
       deductible_vat_amount: z.number().finite().optional().describe("Deductible part of VAT when vat_deduction_mode=partial, or an explicit deductible VAT amount to override the default or configured ratio."),
       expense_account: z.number().describe("Expense account number (e.g. 5000, 6000)"),
-      vat_account: z.number().optional().describe("Input VAT account (default 1510)"),
-      payable_account: z.number().optional().describe("Payable to owner account (default 2110)"),
+      vat_account: z.number().optional().describe("Input VAT account (default: the chart account with role `VAT_INPUT`, when a deductible-VAT posting is made)"),
+      payable_account: z.number().optional().describe("Payable to owner account (default: the chart account with role `OWNER_PAYABLE`)"),
       document_number: z.string().optional().describe("Receipt/document number"),
     },
     { ...create, title: "Book Owner-Paid Expense" },

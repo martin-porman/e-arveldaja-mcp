@@ -35,7 +35,7 @@ Optional account overrides table:
 ## Annual Report
 
 If your chart of accounts uses a custom current-year profit/loss account, add a plain text line under Annual Report:
-- `Current year profit account: 2970`
+- Current year profit account: the account with role `CURRENT_YEAR_RESULT` (create it with `create_account` if the chart has none)
 
 ## Liability Classification
 

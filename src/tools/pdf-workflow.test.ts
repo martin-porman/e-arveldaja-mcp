@@ -126,6 +126,16 @@ function setupPdfWorkflowTool(
           account_type_est: "Maksud",
           account_type_eng: "Taxes",
         },
+        // F7: role-tagged so the PAYABLE role-based fallback (no more
+        // hard-coded DEFAULT_LIABILITY_ACCOUNT) resolves a liability account.
+        {
+          id: 2310,
+          name_est: "Tarnijate võlgnevus",
+          name_eng: "Accounts payable",
+          account_type_est: "Kohustused",
+          account_type_eng: "Liabilities",
+          cl_account_groups: ["PAYABLE"],
+        },
       ]),
       getAccountDimensions: vi.fn().mockResolvedValue([]),
       getVatInfo: vi.fn().mockResolvedValue({ vat_number: "EE123456789" }),

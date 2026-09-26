@@ -17,7 +17,7 @@ import { toolError } from "../tool-error.js";
 import { roundMoney } from "../money.js";
 import { readOnly, create } from "../annotations.js";
 import { logAudit } from "../audit-log.js";
-import { DEFAULT_LIABILITY_ACCOUNT } from "../accounting-defaults.js";
+import { ROLE_FOR_CONSTANT, roleAccount } from "../crm/role-map.js";
 import { parseDocument } from "../document-parser.js";
 import { isValidEeRegistryCode, isValidEeVatNumber, type LayoutTextItem } from "../document-identifiers.js";
 import { summarizeInvoiceExtraction } from "../invoice-extraction-fallback.js";
@@ -896,7 +896,7 @@ export function registerCreatePurchaseInvoiceFromPdfTool(server: McpServer, api:
       ),
       vat_price: z.number().optional().describe("EXACT total VAT from the original invoice; never recalculate. Omit only if truly absent from the document."),
       gross_price: z.number().optional().describe("EXACT total gross from the original invoice; never recalculate. Omit only if truly absent from the document."),
-      liability_accounts_id: z.number().optional().describe("Liability account (default 2310)"),
+      liability_accounts_id: z.number().optional().describe("Liability account (default: the chart account with role `PAYABLE`)"),
       notes: z.string().optional().describe("Optional notes (assumptions made, manual adjustments). Do NOT use the source document filename — the document is already uploaded and attached."),
       ref_number: z.string().optional().describe("Reference number"),
       bank_account_no: z.string().optional().describe("Supplier bank account"),
@@ -986,6 +986,22 @@ export function registerCreatePurchaseInvoiceFromPdfTool(server: McpServer, api:
         });
       }
 
+      // F7 (Task 29): no hard-coded liability account. An explicit override
+      // wins; otherwise the chart account carrying the PAYABLE role. A missing
+      // role fails closed here, before any write, proposing create_account
+      // rather than guessing a fixed account number.
+      let liabilityAccountsId = params.liability_accounts_id;
+      if (liabilityAccountsId === undefined) {
+        const resolvedLiabilityAccount = roleAccount(accounts, ROLE_FOR_CONSTANT.DEFAULT_LIABILITY_ACCOUNT);
+        if (typeof resolvedLiabilityAccount !== "number") {
+          return toolError({
+            error: `No account with role \`${resolvedLiabilityAccount.missing}\` exists in this company's chart.`,
+            hint: `Create the liability account with create_account (role \`${resolvedLiabilityAccount.missing}\`), or pass liability_accounts_id explicitly.`,
+          });
+        }
+        liabilityAccountsId = resolvedLiabilityAccount;
+      }
+
       const invoiceData: CreatePurchaseInvoiceData = {
         clients_id: params.supplier_client_id,
         client_name: supplierName,
@@ -998,7 +1014,7 @@ export function registerCreatePurchaseInvoiceFromPdfTool(server: McpServer, api:
         base_net_price: params.base_net_price,
         base_vat_price: params.base_vat_price,
         base_gross_price: params.base_gross_price,
-        liability_accounts_id: params.liability_accounts_id ?? DEFAULT_LIABILITY_ACCOUNT,
+        liability_accounts_id: liabilityAccountsId,
         bank_ref_number: params.ref_number,
         bank_account_no: params.bank_account_no,
         notes: tagNotes(params.notes),

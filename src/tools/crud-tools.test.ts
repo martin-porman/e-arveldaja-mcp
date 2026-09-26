@@ -225,11 +225,19 @@ describe("M21 create_purchase_invoice non-VAT boundary", () => {
       readonly: {
         getVatInfo,
         getPurchaseArticles,
+        // F7: role-tagged so the PAYABLE role-based fallback (no more
+        // hard-coded DEFAULT_LIABILITY_ACCOUNT) resolves a liability account.
         getAccounts: vi.fn().mockResolvedValue([{
           id: 1510,
           name_est: "Sisendkäibemaks",
           allows_dimensions: false,
           is_valid: true,
+        }, {
+          id: 2310,
+          name_est: "Tarnijate võlgnevus",
+          allows_dimensions: false,
+          is_valid: true,
+          cl_account_groups: ["PAYABLE"],
         }]),
         getAccountDimensions: vi.fn().mockResolvedValue([]),
       },
@@ -282,11 +290,19 @@ describe("M21 create_purchase_invoice non-VAT boundary", () => {
       readonly: {
         getVatInfo,
         getPurchaseArticles,
+        // F7: role-tagged so the PAYABLE role-based fallback (no more
+        // hard-coded DEFAULT_LIABILITY_ACCOUNT) resolves a liability account.
         getAccounts: vi.fn().mockResolvedValue([{
           id: 1510,
           name_est: "Sisendkäibemaks",
           allows_dimensions: false,
           is_valid: true,
+        }, {
+          id: 2310,
+          name_est: "Tarnijate võlgnevus",
+          allows_dimensions: false,
+          is_valid: true,
+          cl_account_groups: ["PAYABLE"],
         }]),
         getAccountDimensions: vi.fn().mockResolvedValue([]),
       },
@@ -2388,7 +2404,7 @@ describe("D01 external-text stripping at CRUD write boundaries", () => {
       readonly: {
         getVatInfo: vi.fn().mockResolvedValue({ vat_number: "EE123456789" }),
         getPurchaseArticles: vi.fn().mockResolvedValue([{ id: 45, name_est: "X", name_eng: "X", vat_accounts_id: 1510, cl_vat_articles_id: 1, vat_rate_dropdown: "24" }]),
-        getAccounts: vi.fn().mockResolvedValue([{ id: 1510, name_est: "X", allows_dimensions: false, is_valid: true }]),
+        getAccounts: vi.fn().mockResolvedValue([{ id: 1510, name_est: "X", allows_dimensions: false, is_valid: true }, { id: 2310, name_est: "Y", allows_dimensions: false, is_valid: true, cl_account_groups: ["PAYABLE"] }]),
         getAccountDimensions: vi.fn().mockResolvedValue([]),
       },
       purchaseInvoices: { createAndSetTotals },
@@ -2446,7 +2462,7 @@ describe("D01 external-text stripping at CRUD write boundaries", () => {
       readonly: {
         getVatInfo: vi.fn().mockResolvedValue({ vat_number: "EE123456789" }),
         getPurchaseArticles: vi.fn().mockResolvedValue([{ id: 45, name_est: "X", name_eng: "X", vat_accounts_id: 1510, cl_vat_articles_id: 1, vat_rate_dropdown: "24" }]),
-        getAccounts: vi.fn().mockResolvedValue([{ id: 1510, name_est: "X", allows_dimensions: false, is_valid: true }]),
+        getAccounts: vi.fn().mockResolvedValue([{ id: 1510, name_est: "X", allows_dimensions: false, is_valid: true }, { id: 2310, name_est: "Y", allows_dimensions: false, is_valid: true, cl_account_groups: ["PAYABLE"] }]),
         getAccountDimensions: vi.fn().mockResolvedValue([]),
       },
       purchaseInvoices: { createAndSetTotals },
@@ -2472,7 +2488,7 @@ describe("D01 external-text stripping at CRUD write boundaries", () => {
       readonly: {
         getVatInfo: vi.fn().mockResolvedValue({ vat_number: "EE123456789" }),
         getPurchaseArticles: vi.fn().mockResolvedValue([{ id: 45, name_est: "X", name_eng: "X", vat_accounts_id: 1510, cl_vat_articles_id: 1, vat_rate_dropdown: "24" }]),
-        getAccounts: vi.fn().mockResolvedValue([{ id: 1510, name_est: "X", allows_dimensions: false, is_valid: true }]),
+        getAccounts: vi.fn().mockResolvedValue([{ id: 1510, name_est: "X", allows_dimensions: false, is_valid: true }, { id: 2310, name_est: "Y", allows_dimensions: false, is_valid: true, cl_account_groups: ["PAYABLE"] }]),
         getAccountDimensions: vi.fn().mockResolvedValue([]),
       },
       purchaseInvoices: { createAndSetTotals },

@@ -15,7 +15,8 @@ import { logAudit } from "../audit-log.js";
 import { roundMoney } from "../money.js";
 import type { AccountDimension, BankAccount, Transaction } from "../types/api.js";
 import { jsonObjectInput, parseJsonObject, type ApiContext } from "./crud-tools.js";
-import { DEFAULT_OTHER_FINANCIAL_EXPENSE_ACCOUNT, DEFAULT_OWNER_PAYABLE_ACCOUNT } from "../accounting-defaults.js";
+import { DEFAULT_OTHER_FINANCIAL_EXPENSE_ACCOUNT } from "../accounting-defaults.js";
+import { ROLE_FOR_CONSTANT } from "../crm/role-map.js";
 import {
   bookOwnerExpenseFromProjection,
   computeOwnerExpenseJournalProjection,
@@ -1436,7 +1437,7 @@ export function resolveReviewItemPlan(
       : ["create_journal"];
     const ownerExpenseSummary = ownerReimbursementToolAvailable
       ? "After the missing VAT/business-use answers are known, continue with create_owner_expense_reimbursement instead of forcing this through purchase-invoice booking."
-      : `After the missing VAT/business-use answers are known, book it as an owner reimbursement with create_journal — debit the business expense (net, plus non-deductible VAT) and credit the owner-payable account (default ${DEFAULT_OWNER_PAYABLE_ACCOUNT}). The Estonian tax helpers are disabled in this deployment (EARVELDAJA_DISABLE_TAX_TOOLS); do not force it through purchase-invoice booking.`;
+      : `After the missing VAT/business-use answers are known, book it as an owner reimbursement with create_journal — debit the business expense (net, plus non-deductible VAT) and credit the account with role \`${ROLE_FOR_CONSTANT.DEFAULT_OWNER_PAYABLE_ACCOUNT}\` (create it with \`create_account\` if the chart has none). The Estonian tax helpers are disabled in this deployment (EARVELDAJA_DISABLE_TAX_TOOLS); do not force it through purchase-invoice booking.`;
     return {
       review_type: "receipt_review",
       status: (guidance?.follow_up_questions.length ?? 0) > 0 ? "needs_answers" : "ready_for_action",

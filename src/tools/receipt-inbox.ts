@@ -61,7 +61,17 @@ import {
   buildReceiptReviewGuidance,
 } from "../estonian-accounting-guidance.js";
 import { remapHiddenGranularWorkflowResult } from "../workflow-response.js";
-import { DEFAULT_LIABILITY_ACCOUNT, EMTA_PREPAYMENT_ACCOUNT } from "../accounting-defaults.js";
+import { ROLE_FOR_CONSTANT, roleAccount } from "../crm/role-map.js";
+
+/**
+ * F7 (Task 29): no hard-coded liability account. The chart account carrying
+ * the PAYABLE role, or `undefined` when the CRM's roles.json has not defined
+ * it yet for this company — never a guessed fixed number.
+ */
+function defaultLiabilityAccountId(accounts: Account[]): number | undefined {
+  const resolved = roleAccount(accounts, ROLE_FOR_CONSTANT.DEFAULT_LIABILITY_ACCOUNT);
+  return typeof resolved === "number" ? resolved : undefined;
+}
 import {
   RECEIPT_BATCH_EXECUTION_MODES,
   type ReceiptApprovedManifestEntry,
@@ -295,7 +305,7 @@ export function groupTransactionsByCounterparty(transactions: Transaction[]): Tr
 }
 
 
-function buildSuggestionFromBookingHistory(bookingSuggestion: BookingSuggestion): ClassifiedTransactionSuggestion {
+function buildSuggestionFromBookingHistory(accounts: Account[], bookingSuggestion: BookingSuggestion): ClassifiedTransactionSuggestion {
   return {
     purchase_article_id: bookingSuggestion.item.cl_purchase_articles_id,
     purchase_article_name: bookingSuggestion.suggested_purchase_article?.name,
@@ -304,7 +314,7 @@ function buildSuggestionFromBookingHistory(bookingSuggestion: BookingSuggestion)
       ? `${bookingSuggestion.suggested_account.id} ${bookingSuggestion.suggested_account.name_est}`
       : undefined,
     purchase_account_dimensions_id: bookingSuggestion.item.purchase_accounts_dimensions_id ?? undefined,
-    liability_account_id: bookingSuggestion.suggested_liability_account_id ?? DEFAULT_LIABILITY_ACCOUNT,
+    liability_account_id: bookingSuggestion.suggested_liability_account_id ?? defaultLiabilityAccountId(accounts),
     vat_rate_dropdown: bookingSuggestion.item.vat_rate_dropdown ?? undefined,
     reversed_vat_id: bookingSuggestion.item.reversed_vat_id ?? undefined,
     source: bookingSuggestion.source,
@@ -388,7 +398,7 @@ function buildSuggestionFromRule(
       ? `${account.id} ${account.name_est}`
       : baseSuggestion?.purchase_account_name,
     purchase_account_dimensions_id: purchaseAccountDimensionsId,
-    liability_account_id: rule.liability_account_id ?? baseSuggestion?.liability_account_id ?? DEFAULT_LIABILITY_ACCOUNT,
+    liability_account_id: rule.liability_account_id ?? baseSuggestion?.liability_account_id ?? defaultLiabilityAccountId(accounts),
     vat_rate_dropdown: rule.vat_rate_dropdown ?? baseSuggestion?.vat_rate_dropdown,
     reversed_vat_id: rule.reversed_vat_id ?? baseSuggestion?.reversed_vat_id,
     source: "local_rules",
@@ -400,8 +410,9 @@ function buildSuggestionFromRule(
 
 /**
  * Resolve the EMTA prepayment account (ettemaksukonto) in a company's chart.
- * The exact id wins; otherwise we look for an account that specifically names
- * the prepayment account, but never a known non-asset account (liability/
+ * The chart account carrying the TAX_PREPAYMENT role wins (F7: no hard-coded
+ * id); otherwise we look for an account that specifically names the
+ * prepayment account, but never a known non-asset account (liability/
  * equity/revenue/expense) and never a clearing/intermediate ("vahekonto")
  * account — so we never fall onto a customer/supplier prepayment or a
  * tax-liability/clearing account that merely contains the word "ettemaks".
@@ -410,9 +421,10 @@ function buildSuggestionFromRule(
  * unambiguous candidate.
  */
 function findEmtaPrepaymentAccount(accounts: Account[]): Account | undefined {
-  const byId = accounts.find(candidate => candidate.id === EMTA_PREPAYMENT_ACCOUNT);
-  if (byId) {
-    return byId;
+  const byRole = roleAccount(accounts, ROLE_FOR_CONSTANT.EMTA_PREPAYMENT_ACCOUNT);
+  if (typeof byRole === "number") {
+    const account = accounts.find(candidate => candidate.id === byRole);
+    if (account) return account;
   }
 
   const candidates = accounts.filter(candidate => {
@@ -476,7 +488,7 @@ function buildForcedCategorySuggestion(
   ];
   if (!account) {
     reasonParts.push(
-      `Could not locate the EMTA prepayment account (expected id ${EMTA_PREPAYMENT_ACCOUNT}) in this company's chart — set the contra account manually.`,
+      `Could not locate an account with role \`${ROLE_FOR_CONSTANT.EMTA_PREPAYMENT_ACCOUNT}\` in this company's chart — propose create_account (role \`${ROLE_FOR_CONSTANT.EMTA_PREPAYMENT_ACCOUNT}\`) or set the contra account manually.`,
     );
   }
   if (manualReviewReason) {
@@ -488,7 +500,7 @@ function buildForcedCategorySuggestion(
     purchase_article_name: undefined,
     purchase_account_id: account?.id,
     purchase_account_name: account ? `${account.id} ${account.name_est}` : undefined,
-    liability_account_id: DEFAULT_LIABILITY_ACCOUNT,
+    liability_account_id: defaultLiabilityAccountId(accounts),
     source: "category_default",
     reason: reasonParts.join(" "),
   };
@@ -513,7 +525,7 @@ export function buildClassificationSuggestion(
   }
 
   if (options?.bookingSuggestion?.source === "supplier_history") {
-    return buildSuggestionFromBookingHistory(options.bookingSuggestion);
+    return buildSuggestionFromBookingHistory(accounts, options.bookingSuggestion);
   }
 
   let articleKeywords = ["muu", "other", "general"];
@@ -572,7 +584,7 @@ export function buildClassificationSuggestion(
     purchase_article_name: article?.name_est ?? article?.name_eng,
     purchase_account_id: account?.id ?? article?.accounts_id,
     purchase_account_name: account ? `${account.id} ${account.name_est}` : undefined,
-    liability_account_id: DEFAULT_LIABILITY_ACCOUNT,
+    liability_account_id: defaultLiabilityAccountId(accounts),
     source: article ? "keyword_match" : "fallback",
     reason: options?.manualReviewReason ? `${reason} ${options.manualReviewReason}` : reason,
   };

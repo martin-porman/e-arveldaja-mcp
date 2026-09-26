@@ -185,7 +185,9 @@ function makeApi(spies: Partial<ApiSpies> = {}): { api: never; spies: ApiSpies }
       invalidate,
     },
     readonly: {
-      getAccounts: vi.fn().mockResolvedValue([]),
+      // F7: role-tagged so the PAYABLE role-based fallback (no more
+      // hard-coded DEFAULT_LIABILITY_ACCOUNT) resolves a liability account.
+      getAccounts: vi.fn().mockResolvedValue([{ id: 2310, cl_account_groups: ["PAYABLE"] }]),
       getPurchaseArticles: vi.fn().mockResolvedValue([]),
       getVatInfo: vi.fn().mockResolvedValue({ vat_number: "EE123456789" }),
       getBankAccounts: vi.fn().mockResolvedValue([]),

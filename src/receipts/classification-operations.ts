@@ -29,7 +29,7 @@ import {
   getBookingSuggestionVatConfig,
 } from "../tools/receipt-extraction.js";
 import { buildClassificationReviewGuidance } from "../estonian-accounting-guidance.js";
-import { DEFAULT_LIABILITY_ACCOUNT } from "../accounting-defaults.js";
+import { ROLE_FOR_CONSTANT } from "../crm/role-map.js";
 // Shared classify helpers stay in receipt-inbox.ts (several are exported for the
 // pure-unit tests). Importing them here forms the same runtime-safe body-only
 // import cycle that batch-operations.ts already relies on: every cross-reference
@@ -307,7 +307,11 @@ class ClassificationOperationsImpl implements ClassificationOperations {
             purchase_article_id: resolved.suggestion.purchase_article_id ?? null,
             purchase_account_id: purchaseItem.purchase_accounts_id ?? null,
             purchase_account_dimensions_id: purchaseItem.purchase_accounts_dimensions_id ?? null,
-            liability_account_id: resolved.suggestion.liability_account_id ?? DEFAULT_LIABILITY_ACCOUNT,
+            // F7 (Task 29): no hard-coded liability account. `resolved.suggestion`
+            // already resolved the PAYABLE-role account (or left it undefined
+            // when the chart has no such role) in buildClassificationSuggestion;
+            // this fingerprint faithfully records that outcome, never a guess.
+            liability_account_id: resolved.suggestion.liability_account_id ?? null,
             vat_rate_dropdown: purchaseItem.vat_rate_dropdown ?? null,
             vat_accounts_id: purchaseItem.vat_accounts_id ?? null,
             cl_vat_articles_id: purchaseItem.cl_vat_articles_id ?? null,
@@ -650,6 +654,16 @@ class ClassificationOperationsImpl implements ClassificationOperations {
             continue;
           }
 
+          // F7 (Task 29): no hard-coded liability account. `resolved.suggestion`
+          // already resolved the PAYABLE-role account, or left it undefined when
+          // the chart has none — fail closed here (skip, never guess a number).
+          if (resolved.suggestion.liability_account_id === undefined) {
+            notes.push(
+              `Transaction ${transaction.id}: no account with role \`${ROLE_FOR_CONSTANT.DEFAULT_LIABILITY_ACCOUNT}\` exists in this company's chart — propose create_account (role \`${ROLE_FOR_CONSTANT.DEFAULT_LIABILITY_ACCOUNT}\`) or set the liability account manually. Skipped.`,
+            );
+            continue;
+          }
+
           const invoice = await api.purchaseInvoices.createAndSetTotals(
             {
               clients_id: supplierId,
@@ -660,7 +674,7 @@ class ClassificationOperationsImpl implements ClassificationOperations {
               term_days: 0,
               cl_currencies_id: transactionCurrency,
               ...(transactionCurrency !== "EUR" ? { currency_rate: transactionCurrencyRate } : {}),
-              liability_accounts_id: resolved.suggestion.liability_account_id ?? DEFAULT_LIABILITY_ACCOUNT,
+              liability_accounts_id: resolved.suggestion.liability_account_id,
               notes: tagNotes(`Auto-created from classified bank transaction ${transaction.id}`),
               items: [purchaseItem],
               // The source is the bank transaction, not a file (plan R4a Task 25):

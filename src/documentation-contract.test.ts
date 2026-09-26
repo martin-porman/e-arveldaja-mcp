@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { readFileSync } from "fs";
+import { readdirSync, readFileSync } from "fs";
 import { resolve } from "path";
 import { getProjectRoot } from "./paths.js";
 
@@ -135,6 +135,19 @@ describe("documentation contract: safe prompt pipeline", () => {
       expect(section).toContain("src/prompt-registry.ts");
       expect(section).toMatch(/plan handle is not (user )?approval/i);
       expect(section).toMatch(/string prompt argument/i);
+    });
+  });
+
+  describe("F7: workflow prompts name chart roles, not hard-coded account numbers", () => {
+    it("the workflows name roles, not account numbers (F7), except the switched-off Wise and Lightyear flows", () => {
+      const root = getProjectRoot();
+      const files = [
+        ...readdirSync(resolve(root, "workflows")).map((f) => `workflows/${f}`),
+        ...readdirSync(resolve(root, ".claude/commands")).map((f) => `.claude/commands/${f}`),
+        "accounting-rules.md",
+      ];
+      const numbered = files.filter((f) => /\b(2310|1510|2110|1210|2960|2650|2656|8900|1516|2900|2940|2970|8610|8600|8500|8400)\b/.test(readFileSync(resolve(root, f), "utf8")));
+      expect(numbered.sort()).toEqual([".claude/commands/import-wise.md", ".claude/commands/lightyear-booking.md", "workflows/import-wise.md", "workflows/lightyear-booking.md"]);
     });
   });
 });

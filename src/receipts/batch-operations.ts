@@ -8,7 +8,6 @@ import { reportProgress } from "../progress.js";
 import { wrapUntrustedOcr } from "../mcp-json.js";
 import { normalizeCompanyName } from "../company-name.js";
 import { parseDocument } from "../document-parser.js";
-import { DEFAULT_LIABILITY_ACCOUNT } from "../accounting-defaults.js";
 import {
   type ExtractionConfidenceSignals,
   type InvoiceExtractionFallback,

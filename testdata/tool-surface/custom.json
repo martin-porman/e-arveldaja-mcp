@@ -2,12 +2,12 @@
   "profile": "custom",
   "measurement": {
     "toolCount": 86,
-    "toolsListBytes": 81866,
+    "toolsListBytes": 81934,
     "descriptionsBytes": 10552,
-    "inputSchemasBytes": 50669,
+    "inputSchemasBytes": 50737,
     "largestTool": {
       "name": "create_purchase_invoice_from_pdf",
-      "bytes": 3627
+      "bytes": 3661
     },
     "serverInstructionsBytes": 932,
     "promptMetadataBytes": 7703,
@@ -1489,7 +1489,7 @@
             "type": "string"
           },
           "liability_accounts_id": {
-            "description": "Liability account (default 2310)",
+            "description": "Liability account (default: the chart account with role `PAYABLE`)",
             "type": "number"
           },
           "notes": {
@@ -2356,7 +2356,7 @@
             "type": "string"
           },
           "liability_accounts_id": {
-            "description": "Liability account (default 2310)",
+            "description": "Liability account (default: the chart account with role `PAYABLE`)",
             "type": "number"
           },
           "notes": {

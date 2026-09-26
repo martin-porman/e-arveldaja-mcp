@@ -2,9 +2,9 @@
   "profile": "full",
   "measurement": {
     "toolCount": 149,
-    "toolsListBytes": 156541,
+    "toolsListBytes": 156724,
     "descriptionsBytes": 21498,
-    "inputSchemasBytes": 99081,
+    "inputSchemasBytes": 99264,
     "largestTool": {
       "name": "process_accounting_document",
       "bytes": 4718
@@ -2357,7 +2357,7 @@
             "type": "string"
           },
           "liability_accounts_id": {
-            "description": "Liability account (default 2310)",
+            "description": "Liability account (default: the chart account with role `PAYABLE`)",
             "type": "number"
           },
           "notes": {
@@ -3608,7 +3608,7 @@
             "type": "string"
           },
           "liability_accounts_id": {
-            "description": "Liability account (default 2310)",
+            "description": "Liability account (default: the chart account with role `PAYABLE`)",
             "type": "number"
           },
           "notes": {
@@ -4342,11 +4342,11 @@
             "type": "integer"
           },
           "payable_account": {
-            "description": "Payable to owner account (default 2110)",
+            "description": "Payable to owner account (default: the chart account with role `OWNER_PAYABLE`)",
             "type": "number"
           },
           "vat_account": {
-            "description": "Input VAT account (default 1510)",
+            "description": "Input VAT account (default: the chart account with role `VAT_INPUT`, when a deductible-VAT posting is made)",
             "type": "number"
           },
           "vat_amount": {

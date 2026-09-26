@@ -23,7 +23,9 @@ function makeStandardAccounts(): Account[] {
     // Liabilities — standard e-arveldaja chart numbers/names (resolvers match by name)
     makeAccount(2650, "C", "Kohustused", "Dividendivõlad", "Dividend payable"),
     makeAccount(2656, "C", "Kohustused", "Dividenditulumaksu võlg", "CIT payable"),
-    makeAccount(2110, "C", "Kohustused", "Võlg omanikule", "Owner payable"),
+    // F7: role-tagged so the OWNER_PAYABLE role-based fallback (no more
+    // hard-coded DEFAULT_OWNER_PAYABLE_ACCOUNT) resolves to this account.
+    makeAccount(2110, "C", "Kohustused", "Võlg omanikule", "Owner payable", { cl_account_groups: ["OWNER_PAYABLE"] }),
     // Equity
     makeAccount(2900, "C", "Omakapital", "Osakapital või aktsiakapital nimiväärtuses", "Share capital"),
     makeAccount(2960, "C", "Omakapital", "Eelmiste perioodide jaotamata kasum (kahjum)", "Retained earnings"),
@@ -32,7 +34,9 @@ function makeStandardAccounts(): Account[] {
     // Income tax expense (RTJ Schema 1 "Tulumaks" line, 8900–8999)
     makeAccount(8900, "D", "Kulud", "Tulumaks", "Income tax expense"),
     // VAT
-    makeAccount(1510, "D", "Varad", "Sisendkäibemaks", "Input VAT"),
+    // F7: role-tagged so the VAT_INPUT role-based fallback (no more
+    // hard-coded DEFAULT_VAT_ACCOUNT) resolves to this account.
+    makeAccount(1510, "D", "Varad", "Sisendkäibemaks", "Input VAT", { cl_account_groups: ["VAT_INPUT"] }),
   ];
 }
 

@@ -354,7 +354,7 @@ describe("createAndMaybeMatchPurchaseInvoice", () => {
     }] as any;
     const consumed = new Set<number>();
 
-    const context = { clients: [], purchaseInvoices: [], purchaseArticlesWithVat: [], accounts: [], isVatRegistered: true } as any;
+    const context = { clients: [], purchaseInvoices: [], purchaseArticlesWithVat: [], accounts: [{ id: 2310, name_est: "Tarnijate võlgnevus", name_eng: "Accounts payable", cl_account_groups: ["PAYABLE"] }], isVatRegistered: true } as any;
     const supplierResolution = {
       found: true, created: false, match_type: "exact_name",
       client: { id: 7, name: "Supplier OÜ", is_supplier: true, is_client: false, cl_code_country: "EE", is_member: false, send_invoice_to_email: false, send_invoice_to_accounting_email: false, is_deleted: false },
@@ -407,7 +407,7 @@ describe("createAndMaybeMatchPurchaseInvoice", () => {
         getAccountDimensions: vi.fn().mockResolvedValue(accountDimensions),
       },
     } as any;
-    const context = { clients: [], purchaseInvoices: [], purchaseArticlesWithVat: [], accounts: [], isVatRegistered: true } as any;
+    const context = { clients: [], purchaseInvoices: [], purchaseArticlesWithVat: [], accounts: [{ id: 2310, name_est: "Tarnijate võlgnevus", name_eng: "Accounts payable", cl_account_groups: ["PAYABLE"] }], isVatRegistered: true } as any;
     const supplierResolution = {
       found: true, created: false, match_type: "exact_name",
       client: { id: 7, name: "Supplier OÜ", is_supplier: true, is_client: false, cl_code_country: "EE", is_member: false, send_invoice_to_email: false, send_invoice_to_accounting_email: false, is_deleted: false },
@@ -461,7 +461,7 @@ describe("createAndMaybeMatchPurchaseInvoice", () => {
       api,
       call: () => createAndMaybeMatchPurchaseInvoice(
         api,
-        { clients: [], purchaseInvoices: [], purchaseArticlesWithVat: [], accounts: [], isVatRegistered: true },
+        { clients: [], purchaseInvoices: [], purchaseArticlesWithVat: [], accounts: [{ id: 2310, name_est: "Tarnijate võlgnevus", name_eng: "Accounts payable", cl_account_groups: ["PAYABLE"] }], isVatRegistered: true },
         toSnapshot({ name: "receipt.pdf", path: "/tmp/receipt.pdf", extension: ".pdf", file_type: "pdf", size_bytes: 123, modified_at: "2026-03-22T00:00:00.000Z" }),
         {
           supplier_name: "Supplier OÜ",
@@ -561,7 +561,7 @@ describe("createAndMaybeMatchPurchaseInvoice", () => {
     } as any;
     const result = await createAndMaybeMatchPurchaseInvoice(
       api,
-      { clients: [], purchaseInvoices: [], purchaseArticlesWithVat: [], accounts: [], isVatRegistered: true },
+      { clients: [], purchaseInvoices: [], purchaseArticlesWithVat: [], accounts: [{ id: 2310, name_est: "Tarnijate võlgnevus", name_eng: "Accounts payable", cl_account_groups: ["PAYABLE"] }], isVatRegistered: true },
       snapshot,
       {
         supplier_name: "Supplier OÜ", invoice_number: "INV-1", invoice_date: "2026-07-15",
@@ -1841,7 +1841,7 @@ describe("buildClassificationSuggestion — EMTA tax payments", () => {
 
     expect(suggestion.purchase_account_id).toBeUndefined();
     expect(suggestion.purchase_account_name).toBeUndefined();
-    expect(suggestion.reason).toContain("Could not locate the EMTA prepayment account");
+    expect(suggestion.reason).toContain("Could not locate an account with role `TAX_PREPAYMENT`");
   });
 
   it("emits no account id and a warning when the EMTA prepayment account is absent entirely", () => {
@@ -1852,7 +1852,7 @@ describe("buildClassificationSuggestion — EMTA tax payments", () => {
     const suggestion = buildClassificationSuggestion(articles, noPrepaymentChart, "tax_payments", "emta");
 
     expect(suggestion.purchase_account_id).toBeUndefined();
-    expect(suggestion.reason).toContain("expected id 1516");
+    expect(suggestion.reason).toContain("role `TAX_PREPAYMENT`");
   });
 
   it("rejects an EMTA-named clearing/intermediate (vahekonto) account even though it names the tax authority", () => {
@@ -1863,7 +1863,7 @@ describe("buildClassificationSuggestion — EMTA tax payments", () => {
     const suggestion = buildClassificationSuggestion(articles, clearingChart, "tax_payments", "emta");
 
     expect(suggestion.purchase_account_id).toBeUndefined();
-    expect(suggestion.reason).toContain("Could not locate the EMTA prepayment account");
+    expect(suggestion.reason).toContain("Could not locate an account with role `TAX_PREPAYMENT`");
   });
 
   it("prefers the EMTA-named prepayment account over a generic one regardless of chart order", () => {

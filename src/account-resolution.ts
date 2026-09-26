@@ -19,6 +19,7 @@ import {
   SECURITIES_INCOME_ACCOUNT,
   SECURITIES_EXPENSE_ACCOUNT,
 } from "./accounting-defaults.js";
+import { roleAccount, type RoleFallback } from "./crm/role-map.js";
 
 /**
  * Return the id (account number) of the lowest-numbered ACTIVE account whose
@@ -37,16 +38,39 @@ export function findAccountByName(accounts: Account[], pattern: RegExp): number 
 
 /**
  * Resolve an account: explicit override wins; otherwise the first active
- * name match; otherwise the standard-chart fallback constant.
+ * name match; otherwise the fallback.
+ *
+ * F7 (Task 29): the fallback may also be a `roleFallback(...)` sentinel
+ * (`src/crm/role-map.ts`) instead of a hard-coded number — the overload below
+ * then resolves the chart-role account and can answer `{ missing }` instead
+ * of guessing a number. Not yet wired into this file's own name-resolved
+ * helpers below (their only out-of-this-task consumers, or lack of test
+ * coverage for a compliance-sensitive path, kept them out of Task 29's
+ * explicit call-site scope — see OUTPUT); it is available for the specific
+ * F7 call sites and for future migrations of these helpers.
  */
 export function resolveAccountByName(
   accounts: Account[],
   pattern: RegExp,
   fallback: number,
   override?: number,
-): number {
+): number;
+export function resolveAccountByName(
+  accounts: Account[],
+  pattern: RegExp,
+  fallback: RoleFallback,
+  override?: number,
+): number | { missing: string };
+export function resolveAccountByName(
+  accounts: Account[],
+  pattern: RegExp,
+  fallback: number | RoleFallback,
+  override?: number,
+): number | { missing: string } {
   if (override !== undefined) return override;
-  return findAccountByName(accounts, pattern) ?? fallback;
+  const nameMatch = findAccountByName(accounts, pattern);
+  if (nameMatch !== undefined) return nameMatch;
+  return typeof fallback === "number" ? fallback : roleAccount(accounts, fallback.role);
 }
 
 // Name patterns are anchored/specific enough to match exactly one account in the
