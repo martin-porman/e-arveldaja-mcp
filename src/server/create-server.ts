@@ -56,6 +56,7 @@ import { createConnectionState } from "../runtime/connection-manager.js";
 import { createAuditLabelResolver, normalizeAuditCompanyName } from "../runtime/audit-label-resolver.js";
 import { createRuntimeSafetyContext } from "../runtime-safety-context.js";
 import { crmPersistence, fetchIdentity, type StorePersistence, type StoredRecord } from "../crm/persistence.js";
+import type { CrmAccount, CrmAccountType } from "../crm/mappers.js";
 import {
   buildSetupModePayload,
   createSetupModeApiContext,
@@ -343,6 +344,47 @@ export async function createMcpServer(
     // `judgments` is a sibling top-level CRM route, not nested under `fork/`.
     api.crm = {
       recordJudgment: (body) => persistenceClient.post<{ id: string }>("/judgments", body),
+      // Task 28: create_account, `prepare` scope, no approval (spec §5.2). The
+      // CRM route (`crm/src/lib/crm-mcp/writes-bank-accounts.ts`) only echoes
+      // `{ code, created }`; the rest of the RIK-shaped CrmAccount is built
+      // locally from the request plus the same fixed defaults the CRM applies
+      // (isHeading false, isActive true, no counterparty/VAT/dimension flags).
+      // `category` is the caller's chart statement category (required by the
+      // create_account tool schema — the CRM refuses a null category on an
+      // active posting account) and is passed through verbatim.
+      createAccount: async (body) => {
+        const crmType: CrmAccountType = body.type === "INCOME" ? "REVENUE" : body.type;
+        const created = await persistenceClient.post<{ code: string; created: boolean }>("/accounts", {
+          code: body.code,
+          nameEt: body.nameEt,
+          nameEn: null,
+          parentCode: body.parentCode,
+          type: crmType,
+          normalSide: body.normalSide,
+          category: body.category,
+          role: body.role ?? null,
+          workflowStepId: null,
+          reason: body.reason,
+          evidence: body.evidence,
+        });
+        const account: CrmAccount = {
+          code: created.code,
+          nameEt: body.nameEt,
+          nameEn: null,
+          parentCode: body.parentCode,
+          type: crmType,
+          normalSide: body.normalSide,
+          category: body.category,
+          isHeading: false,
+          requiresCounterparty: false,
+          isVatAccount: false,
+          allowsDimension: false,
+          isActive: true,
+          roles: body.role ? [body.role] : [],
+          createdBy: "agent",
+        };
+        return account;
+      },
     };
   }
 

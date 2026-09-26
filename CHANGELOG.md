@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- **CRM-MCP: `create_account`, `propose_account_deactivate`; the `crm` tool profile (18 tools).** `create_account` creates a chart-of-accounts account in the CRM as proposed (`POST /accounts`, prepare scope, no approval — the operator's own "creates it as proposed"); it always creates an active posting account, so `category` (one of the chart's 30 statement categories) is a required argument — the CRM refuses a posting account with no category, and the tool refuses locally before making a request when it is missing. `propose_account_deactivate` returns an approval-only card with a plan handle for `account.deactivate`; it never deactivates by itself — deactivation is execute-scope and gated by the CRM's own approval manifest, outside this fork. The new `crm` profile (auto-selected whenever `CRM_API_URL` is set; the only profile the CRM-MCP runs) is the guided 19 plus these two tools, minus `list_connections` / `switch_connection` / `get_setup_instructions` (a single fixed CRM connection needs no switching or setup instructions) = 18 tools. Switched off, with no CRM behaviour behind them: Wise and Lightyear tools (`process_bank_input`'s Wise branch now refuses explicitly); sale e-invoice delivery; series and bank-account administration; credential and connection tools; the `setup-*` workflows; product administration.
+
 ## [0.25.7] - 2026-09-18
 
 ### Fixed

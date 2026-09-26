@@ -29,6 +29,7 @@ import { registerSearchAccountingRecordsTool } from "../guided/search-accounting
 import { registerInspectAccountingRecordTool } from "../guided/inspect-accounting-record.js";
 import { registerManageSaleInvoiceTool } from "../guided/manage-sale-invoice.js";
 import { registerAccountingInboxTools } from "../tools/accounting-inbox.js";
+import { registerCreateAccountTools } from "../tools/create-account.js";
 import { registerAnalyzeUnconfirmedTools } from "../tools/analyze-unconfirmed.js";
 import { registerWorkflowRecommendationTools } from "../tools/workflow-recommendations.js";
 import { registerPlanTools } from "../plan-tools.js";
@@ -99,6 +100,11 @@ export function registerDomainTools(ctx: RegisterDomainToolsContext): void {
   registerInspectAccountingRecordTool(publicServer, api, toolExposure);
   if (toolExposure.enableSales) registerManageSaleInvoiceTool(publicServer, api, runtimeSafetyContext);
   registerAccountingInboxTools(publicServer, api, runtimeSafetyContext, toolExposure);
+  // F5 (Task 28): CRM-backed create_account (prepare, no approval) and the
+  // approval-only propose_account_deactivate card. Registered unconditionally,
+  // like the other guided façades above; visibility is gated by the tool
+  // catalog/profile boundary (crm and full only, see tool-profile.ts).
+  registerCreateAccountTools(publicServer, api);
   registerAnalyzeUnconfirmedTools(publicServer, api);
   registerWorkflowRecommendationTools(publicServer, toolExposure);
   registerPlanTools(publicServer, runtimeSafetyContext, { profile: toolProfile });

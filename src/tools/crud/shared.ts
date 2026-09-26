@@ -7,6 +7,7 @@ import type { TransactionsApi } from "../../api/transactions.api.js";
 import type { SaleInvoicesApi } from "../../api/sale-invoices.api.js";
 import type { PurchaseInvoicesApi } from "../../api/purchase-invoices.api.js";
 import type { ReferenceDataApi } from "../../api/readonly.api.js";
+import type { CrmAccount } from "../../crm/mappers.js";
 import type {
   Journal,
   Posting,
@@ -26,6 +27,20 @@ export interface JudgmentRecordInput {
   source: string;
 }
 
+/** Body `create_account` sends to `api.crm.createAccount` (Task 28; CRM `POST /accounts`, scope prepare, no approval). */
+export interface CreateAccountInput {
+  code: string;
+  nameEt: string;
+  parentCode: string;
+  type: "ASSET" | "LIABILITY" | "EQUITY" | "INCOME" | "EXPENSE";
+  normalSide: "D" | "C";
+  /** The chart's statement/XBRL category (crm/prisma-v2/data/chart.json); the CRM refuses a null category on an active posting account. */
+  category: string;
+  role?: string;
+  reason: string;
+  evidence: unknown;
+}
+
 export interface ApiContext {
   clients: ClientsApi;
   products: ProductsApi;
@@ -35,12 +50,15 @@ export interface ApiContext {
   purchaseInvoices: PurchaseInvoicesApi;
   readonly: ReferenceDataApi;
   /**
-   * CRM-fork only (Task 27): records one operator judgment against a
-   * workflow-item scope via the CRM's `POST /judgments`. Absent outside the
-   * single "crm" fork connection — every call site must optional-chain it.
+   * CRM-fork only (Task 27/28): records one operator judgment against a
+   * workflow-item scope via the CRM's `POST /judgments`, and creates a chart
+   * account (prepare scope, no approval — `create_account`, Task 28). Absent
+   * outside the single "crm" fork connection — every call site must
+   * optional-chain `crm` itself.
    */
   crm?: {
     recordJudgment(body: JudgmentRecordInput): Promise<{ id: string }>;
+    createAccount(body: CreateAccountInput): Promise<CrmAccount>;
   };
 }
 

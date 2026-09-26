@@ -1,10 +1,10 @@
 {
   "profile": "full",
   "measurement": {
-    "toolCount": 147,
-    "toolsListBytes": 153248,
-    "descriptionsBytes": 21149,
-    "inputSchemasBytes": 96615,
+    "toolCount": 149,
+    "toolsListBytes": 156541,
+    "descriptionsBytes": 21498,
+    "inputSchemasBytes": 99081,
     "largestTool": {
       "name": "process_accounting_document",
       "bytes": 4718
@@ -6499,6 +6499,158 @@
       },
       "name": "save_auto_booking_rule",
       "title": "Save Auto-Booking Rule"
+    },
+    {
+      "annotations": {
+        "destructiveHint": false,
+        "idempotentHint": false,
+        "openWorldHint": true,
+        "readOnlyHint": false
+      },
+      "description": "Create a chart-of-accounts account in the CRM as proposed (prepare scope, no approval). Use when a workflow needs an account the chart does not yet have.",
+      "execution": {
+        "taskSupport": "forbidden"
+      },
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "properties": {
+          "category": {
+            "description": "The chart's statement/XBRL category for this account (required: this tool always creates an active posting account, and the CRM refuses a posting account with no category). One of: accrued_expense, cash, closing, current_year_result, deferred_revenue, depreciation, financial_expense, financial_income, fixed_asset, intangible_asset, inventory, long_term_investment, long_term_loan, materials, operating_expense, other_current_liability, other_income, other_receivable, payable, payroll, prepayment, receivable, reserve, retained_earnings, sales, share_capital, short_term_investment, short_term_loan, tax_payable, tax_receivable.",
+            "enum": [
+              "accrued_expense",
+              "cash",
+              "closing",
+              "current_year_result",
+              "deferred_revenue",
+              "depreciation",
+              "financial_expense",
+              "financial_income",
+              "fixed_asset",
+              "intangible_asset",
+              "inventory",
+              "long_term_investment",
+              "long_term_loan",
+              "materials",
+              "operating_expense",
+              "other_current_liability",
+              "other_income",
+              "other_receivable",
+              "payable",
+              "payroll",
+              "prepayment",
+              "receivable",
+              "reserve",
+              "retained_earnings",
+              "sales",
+              "share_capital",
+              "short_term_investment",
+              "short_term_loan",
+              "tax_payable",
+              "tax_receivable"
+            ],
+            "type": "string"
+          },
+          "code": {
+            "description": "The new account's code.",
+            "minLength": 1,
+            "type": "string"
+          },
+          "evidence": {
+            "additionalProperties": {},
+            "description": "Supporting evidence recorded with the account's provenance.",
+            "propertyNames": {
+              "type": "string"
+            },
+            "type": "object"
+          },
+          "name_et": {
+            "description": "Estonian account name.",
+            "minLength": 1,
+            "type": "string"
+          },
+          "normal_side": {
+            "description": "Normal balance side.",
+            "enum": [
+              "D",
+              "C"
+            ],
+            "type": "string"
+          },
+          "parent_code": {
+            "description": "Parent account code in the chart.",
+            "minLength": 1,
+            "type": "string"
+          },
+          "reason": {
+            "description": "Why this account is being created.",
+            "minLength": 1,
+            "type": "string"
+          },
+          "role": {
+            "description": "Optional posting-rule role to attach, e.g. FIN_EXPENSE_OTHER.",
+            "minLength": 1,
+            "type": "string"
+          },
+          "type": {
+            "description": "Account type.",
+            "enum": [
+              "ASSET",
+              "LIABILITY",
+              "EQUITY",
+              "INCOME",
+              "EXPENSE"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "code",
+          "name_et",
+          "parent_code",
+          "type",
+          "normal_side",
+          "category",
+          "reason",
+          "evidence"
+        ],
+        "type": "object"
+      },
+      "name": "create_account",
+      "title": "Create Account"
+    },
+    {
+      "annotations": {
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": true,
+        "readOnlyHint": true
+      },
+      "description": "Propose deactivating a chart-of-accounts account. Returns an approval card with a plan handle; it never deactivates the account itself. Deactivation is execute-scope and approval-gated in the CRM.",
+      "execution": {
+        "taskSupport": "forbidden"
+      },
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "properties": {
+          "code": {
+            "description": "Account code to deactivate.",
+            "minLength": 1,
+            "type": "string"
+          },
+          "reason": {
+            "description": "Why this account should be deactivated.",
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "code",
+          "reason"
+        ],
+        "type": "object"
+      },
+      "name": "propose_account_deactivate",
+      "title": "Propose Account Deactivate"
     },
     {
       "annotations": {

@@ -70,3 +70,19 @@ above `guided`; the same target/band/backstop apply.
   post-execution results vs. audit trail) or `list_connections` /
   `switch_connection` (read vs. mutation). Marginal savings, boundary-blurring
   risk.
+
+## The `crm` profile (18 tools)
+
+The CRM-MCP fork runs a third, non-donor profile, auto-selected whenever
+`CRM_API_URL` is set (it is the only profile that target runs). It is the
+guided 19 (`GUIDED_TOOL_NAMES`), plus `create_account` and
+`propose_account_deactivate` (F5 — CRM-backed, so they only make sense there),
+minus `list_connections` / `switch_connection` / `get_setup_instructions` (a
+single fixed CRM connection needs no switching or setup instructions) = **18
+tools**, within the ≤ 20 target above.
+
+F9 — switched off, with no CRM behaviour behind them: Wise and Lightyear
+tools (`process_bank_input`'s Wise branch refuses explicitly rather than
+silently omitting the granular tools); sale e-invoice delivery; series and
+bank-account administration; credential and connection tools; the `setup-*`
+workflows; product administration.

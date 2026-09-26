@@ -503,6 +503,18 @@ export function registerProcessBankInputTool(
         }, true);
       }
 
+      // F9 (Task 28, spec §9): the CRM-MCP has no Wise behaviour behind it —
+      // refuse right here, before any read/mutation, rather than reaching
+      // handleWise. CAMT stays on (its CRM-backed path is Task 20/22).
+      if (detected.format === "wise" && process.env.CRM_API_URL?.trim()) {
+        return textResult({
+          error: "Wise import is switched off in the CRM-MCP.",
+          category: "bank_input_switched_off",
+          retry: "never",
+          mutation_occurred: false,
+        }, true);
+      }
+
       return detected.format === "camt"
         ? handleCamt(mode, args, source, snapshot, detected.preflight.value.statement_metadata.iban, detected.preflight.value.statement_metadata.currency)
         : handleWise(mode, args, source, snapshot);

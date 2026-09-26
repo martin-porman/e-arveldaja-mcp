@@ -2,8 +2,23 @@ import type { ToolExposureConfig } from "./config.js";
 import { toolMeta } from "./tool-catalog.js";
 import { AsyncLocalStorage } from "node:async_hooks";
 
-export type ToolProfile = "guided" | "guided-sales" | "standard" | "full" | "custom";
+export type ToolProfile = "guided" | "guided-sales" | "standard" | "full" | "custom" | "crm";
 export const GUIDED_TOOL_NAMES = Object.freeze(`recommend_workflow accounting_inbox continue_accounting_workflow receipt_batch process_accounting_document process_bank_input reconcile_bank_transactions classify_bank_transactions cleanup_camt_possible_duplicate save_auto_booking_rule run_accounting_report search_accounting_records inspect_accounting_record list_connections switch_connection get_setup_instructions get_execution_plan_page get_operation_result_page get_session_log`.split(" "));
+// F9 (Task 28, spec §9): the crm-fork's own profile. The guided 19 minus the
+// connection/setup tools the fork has no behaviour for (a single fixed CRM
+// connection needs no switching or setup instructions), plus the two
+// CRM-backed account tools (F5) = 18, within the ≤20 policy budget
+// (docs/guided-tool-policy.md).
+const CRM_HIDDEN_FROM_GUIDED = new Set(["list_connections", "switch_connection", "get_setup_instructions"]);
+export const CRM_TOOL_NAMES = Object.freeze([
+  ...GUIDED_TOOL_NAMES.filter((name) => !CRM_HIDDEN_FROM_GUIDED.has(name)),
+  "create_account",
+  "propose_account_deactivate",
+]);
+// The two account tools are CRM-backed (`api.crm`), so they are meaningful
+// only under the crm profile; they still must appear in `full` (the
+// exhaustive catalog invariant) but stay out of standard/custom/default.
+const CRM_ONLY_ACCOUNT_TOOL_NAMES = new Set(["create_account", "propose_account_deactivate"]);
 export const SETUP_PROFILE_CHOICES = Object.freeze([
   Object.freeze({ label: "Daily bookkeeping", profile: "guided" as const, enableLightyear: false }),
   Object.freeze({ label: "Daily bookkeeping plus sales invoices", profile: "guided-sales" as const, enableLightyear: false }),
@@ -37,7 +52,8 @@ const GUIDED_AND_FULL_ONLY_TOOL_NAMES = new Set([
   "run_accounting_report", "search_accounting_records", "inspect_accounting_record", "manage_sale_invoice",
 ]);
 export const LEGACY_TOOL_EXPOSURE_ENV_KEYS = ["EARVELDAJA_DISABLE_LIGHTYEAR", "EARVELDAJA_EXPOSE_GRANULAR_TOOLS", "EARVELDAJA_EXPOSE_SETUP_TOOLS", "EARVELDAJA_DISABLE_TAX_TOOLS", "EARVELDAJA_DISABLE_REFERENCE_ADMIN", "EARVELDAJA_DISABLE_ANNUAL_REPORT", "EARVELDAJA_DISABLE_SALES", "EARVELDAJA_DISABLE_PRODUCTS"] as const;
-const VALID = new Set<ToolProfile>(["guided", "guided-sales", "standard", "full", "custom"]);
+const VALID = new Set<ToolProfile>(["guided", "guided-sales", "standard", "full", "custom", "crm"]);
+const CRM = new Set(CRM_TOOL_NAMES);
 const PROFILE_STORAGE = new AsyncLocalStorage<ToolProfile>();
 
 export function runWithToolProfile<T>(profile: ToolProfile, callback: () => T): T {
@@ -49,10 +65,21 @@ export function currentToolProfile(): ToolProfile {
 }
 
 export function parseToolProfile(env: NodeJS.ProcessEnv = process.env): ToolProfile {
+  // The crm-fork target is checked FIRST and wins over every other profile
+  // signal (including the legacy exposure flags below): the CRM-MCP runs the
+  // crm profile only (spec §9). The donor project's own env var name is kept
+  // here only to reject a conflicting explicit value, never to select it.
+  if (env.CRM_API_URL?.trim()) {
+    const raw = env.EARVELDAJA_PROFILE?.trim().toLowerCase();
+    if (raw !== undefined && raw !== "" && raw !== "crm") {
+      throw new Error(`Invalid EARVELDAJA_PROFILE="${raw}": the CRM-MCP runs the crm profile only.`);
+    }
+    return "crm";
+  }
   if (LEGACY_TOOL_EXPOSURE_ENV_KEYS.some((key) => env[key] !== undefined)) return "custom";
   const raw = env.EARVELDAJA_PROFILE?.trim().toLowerCase();
   if (!raw) return "standard";
-  if (!VALID.has(raw as ToolProfile) || raw === "custom") throw new Error(`Invalid EARVELDAJA_PROFILE="${raw}". Must be guided, guided-sales, standard, or full.`);
+  if (!VALID.has(raw as ToolProfile) || raw === "custom" || raw === "crm") throw new Error(`Invalid EARVELDAJA_PROFILE="${raw}". Must be guided, guided-sales, standard, or full.`);
   return raw as ToolProfile;
 }
 
@@ -65,6 +92,11 @@ export function isToolVisibleForProfile(name: string, profile: ToolProfile): boo
   toolMeta(name);
   if (profile === "guided") return GUIDED.has(name);
   if (profile === "guided-sales") return GUIDED_SALES.has(name);
+  if (profile === "crm") return CRM.has(name);
+  // Checked before the full-only/full-and-guided gates below so a crm-target
+  // caller never falls through to them (this branch only runs for
+  // standard/full/custom now that guided/guided-sales/crm are handled above).
+  if (CRM_ONLY_ACCOUNT_TOOL_NAMES.has(name)) return profile === "full";
   if (FULL_ONLY_TOOL_NAMES.has(name)) return profile === "full";
   if (GUIDED_AND_FULL_ONLY_TOOL_NAMES.has(name)) return profile === "full";
   return true;
