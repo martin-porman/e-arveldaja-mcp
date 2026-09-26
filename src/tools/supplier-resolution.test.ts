@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Client } from "../types/api.js";
 import type { ApiContext } from "./crud-tools.js";
-import { resolveSupplierInternal } from "./supplier-resolution.js";
+import { fetchRegistryData, resolveSupplierInternal } from "./supplier-resolution.js";
 
 // resolveSupplierInternal calls fetchRegistryData() when the resolution falls
 // through to "create" mode for an EE supplier with a reg_code. The tests below
@@ -730,5 +730,44 @@ describe("resolveSupplierInternal — P17 legal-entity identity gate", () => {
     );
     expect(create).not.toHaveBeenCalled();
     expect(result.code).toBe("legal_entity_identity_required");
+  });
+});
+
+describe("fetchRegistryData — R4a Task 30 registry URL", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    delete process.env.EARVELDAJA_REGISTRY_URL;
+  });
+
+  it("queries the operator's own registry mirror, not ariregister.rik.ee", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      headers: { get: () => "0" },
+      text: () => Promise.resolve(JSON.stringify({ results: [{ name: "Decora AS", reg_code: "17133416", legal_address: "Tallinn" }] })),
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await fetchRegistryData("17133416");
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const requestedUrl = String(fetchMock.mock.calls[0]![0]);
+    expect(requestedUrl).toBe("http://192.168.10.6:8091/api/autocomplete?q=17133416");
+    expect(requestedUrl).not.toContain("ariregister.rik.ee");
+    expect(result).toEqual({ name: "Decora AS", reg_code: "17133416", address: "Tallinn" });
+  });
+
+  it("honors EARVELDAJA_REGISTRY_URL to target a different mirror", async () => {
+    process.env.EARVELDAJA_REGISTRY_URL = "http://registry.internal:9000";
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      headers: { get: () => "0" },
+      text: () => Promise.resolve(JSON.stringify({ results: [{ name: "Decora AS", reg_code: "17133416" }] })),
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await fetchRegistryData("17133416");
+
+    const requestedUrl = String(fetchMock.mock.calls[0]![0]);
+    expect(requestedUrl).toBe("http://registry.internal:9000/api/autocomplete?q=17133416");
   });
 });

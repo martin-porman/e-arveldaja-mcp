@@ -113,6 +113,21 @@ function normalizeVatForCompare(value?: string | null): string | undefined {
 // Registry lookup
 // ---------------------------------------------------------------------------
 
+/**
+ * R4a Task 30 (GUARD addition): the fork's Estonian business-registry lookup
+ * used to hit the public `ariregister.rik.ee` directly. It now points at the
+ * operator's own registry mirror, the same service the CRM's
+ * `/api/agi/autocomplete` proxy and `searchRegistryCompanies` call
+ * (crm/src/lib/company/company-lookup.ts:84-211: `companyRegistryBaseUrl()`,
+ * default `http://192.168.10.6:8091`, `GET /api/autocomplete?q=...&limit=...`,
+ * body `{ results: [{ name, reg_code, legal_address, ... }] }`) — env
+ * overridable here too, so a deployment can point at a different mirror
+ * without a code change.
+ */
+function registryBaseUrl(): string {
+  return (process.env.EARVELDAJA_REGISTRY_URL?.trim() || "http://192.168.10.6:8091").replace(/\/+$/, "");
+}
+
 export async function fetchRegistryData(regCode?: string, country = "EST", fallbackName?: string): Promise<Record<string, string> | null> {
   if (!regCode || country !== "EST" || !/^\d{8}$/.test(regCode)) {
     return null;
@@ -122,7 +137,7 @@ export async function fetchRegistryData(regCode?: string, country = "EST", fallb
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 10_000);
     const response = await fetch(
-      `https://ariregister.rik.ee/est/api/autocomplete?q=${encodeURIComponent(regCode)}`,
+      `${registryBaseUrl()}/api/autocomplete?q=${encodeURIComponent(regCode)}`,
       { signal: controller.signal },
     );
     clearTimeout(timeout);
@@ -134,12 +149,15 @@ export async function fetchRegistryData(regCode?: string, country = "EST", fallb
     const text = await response.text();
     if (text.length > 64 * 1024) return null;
     const data: unknown = JSON.parse(text);
-    if (!Array.isArray(data) || data.length === 0) return null;
-    const entry = data[0] as Record<string, unknown> | undefined;
+    const results = data && typeof data === "object" && Array.isArray((data as { results?: unknown }).results)
+      ? (data as { results: unknown[] }).results
+      : null;
+    if (!results || results.length === 0) return null;
+    const entry = results[0] as Record<string, unknown> | undefined;
     if (!entry || typeof entry !== "object") return null;
 
-    const name = entry.company_name ?? entry.nimi ?? fallbackName ?? "";
-    const address = entry.address ?? entry.aadress ?? "";
+    const name = entry.name ?? fallbackName ?? "";
+    const address = entry.legal_address ?? "";
     return {
       name: typeof name === "string" ? name : String(name),
       reg_code: regCode,

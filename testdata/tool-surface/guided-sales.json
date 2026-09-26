@@ -2,12 +2,12 @@
   "profile": "guided-sales",
   "measurement": {
     "toolCount": 20,
-    "toolsListBytes": 32917,
+    "toolsListBytes": 32951,
     "descriptionsBytes": 4824,
-    "inputSchemasBytes": 23223,
+    "inputSchemasBytes": 23257,
     "largestTool": {
       "name": "process_accounting_document",
-      "bytes": 4718
+      "bytes": 4752
     },
     "serverInstructionsBytes": 932,
     "promptMetadataBytes": 11072,
@@ -593,7 +593,7 @@
             "type": "string"
           },
           "liability_accounts_id": {
-            "description": "mode='create': liability account (default 2310).",
+            "description": "mode='create': liability account (default: the chart account with role `PAYABLE`).",
             "type": "number"
           },
           "mode": {

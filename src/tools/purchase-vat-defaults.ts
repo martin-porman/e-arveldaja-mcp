@@ -10,12 +10,19 @@ import { ROLE_FOR_CONSTANT } from "../crm/role-map.js";
 // tools/receipt-inbox-booking.ts's buildSyntheticItem — and none pass one
 // down here), so a missing article default now leaves vat_accounts_id UNSET
 // rather than guessing an account number; the warning below names the chart
-// role that should hold it (VAT_INPUT) instead. cl_vat_articles_id is a VAT
-// article classification id, not a chart account, so it keeps its static
-// default.
-const VAT_REGISTERED_FALLBACK = {
-  cl_vat_articles_id: 1,
-} as const;
+// role that should hold it (VAT_INPUT) instead.
+//
+// R4a Task 30 (GUARD addition): cl_vat_articles_id never reaches the CRM —
+// `PurchaseInvoicesApi.createAndSetTotals` (purchase-invoices.api.ts) sends
+// each line's VAT treatment as a `vatCode` resolved by `vatCodeFor`
+// (crm/vat-map.ts), never this field; it is a RIK-shaped API-compatibility
+// echo only. Its `11` ("no VAT") is a fixed RIK classification-list value,
+// not a per-company guess, so the M21 canonicalization below still assigns
+// it for a non-VAT-registered company. What WAS a guess is the
+// VAT-registered branch's silent fallback to article `1` when no
+// purchase-article default matched — the same kind of guess F7 removed for
+// vat_accounts_id — so that fallback is gone: a missing match now leaves
+// cl_vat_articles_id UNSET too, same as vat_accounts_id.
 
 const warnedFallbackKeys = new Set<string>();
 let connectionScope = "";
@@ -187,12 +194,12 @@ export function applyPurchaseVatDefaults(
   if (merged.vat_accounts_id == null && defaults.vat_accounts_id !== undefined) {
     merged.vat_accounts_id = defaults.vat_accounts_id;
   }
-  merged.cl_vat_articles_id ??= defaults.cl_vat_articles_id ?? VAT_REGISTERED_FALLBACK.cl_vat_articles_id;
+  merged.cl_vat_articles_id ??= defaults.cl_vat_articles_id;
 
   if (defaults.vat_accounts_id === undefined || defaults.cl_vat_articles_id === undefined) {
     warnFallbackOnce(
       "vat-registered",
-      `Could not resolve purchase VAT defaults from purchase_articles; leaving vat_accounts_id unset (no hard-coded fallback — the account with role \`${ROLE_FOR_CONSTANT.DEFAULT_VAT_ACCOUNT}\` must be set explicitly or via an article default) and falling back to cl_vat_articles_id=${VAT_REGISTERED_FALLBACK.cl_vat_articles_id}.`
+      `Could not resolve purchase VAT defaults from purchase_articles; leaving vat_accounts_id and cl_vat_articles_id unset (no hard-coded fallback — the account with role \`${ROLE_FOR_CONSTANT.DEFAULT_VAT_ACCOUNT}\` must be set explicitly or via an article default).`
     );
   }
   return merged;

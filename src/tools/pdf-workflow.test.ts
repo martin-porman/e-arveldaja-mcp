@@ -1301,7 +1301,10 @@ describe("resolve_supplier external-text display matrix (P07)", () => {
     const fetchMock = vi.fn().mockResolvedValue({
       ok: true,
       headers: { get: () => "128" },
-      text: () => Promise.resolve(JSON.stringify([{ company_name: companyName, address }])),
+      // R4a Task 30: the registry mirror at http://192.168.10.6:8091 answers
+      // `{ results: [{ name, legal_address, ... }] }` (crm/src/lib/company/
+      // company-lookup.ts:206 `AgiSuggestion`), not ariregister.rik.ee's bare array.
+      text: () => Promise.resolve(JSON.stringify({ results: [{ name: companyName, legal_address: address }] })),
     });
     vi.stubGlobal("fetch", fetchMock);
     return fetchMock;

@@ -1,3 +1,5 @@
+import { createHash } from "node:crypto";
+import { readFile } from "node:fs/promises";
 import {
   LiteParse,
   type ImageMode,
@@ -7,6 +9,82 @@ import {
 } from "@llamaindex/liteparse";
 
 const HIGH_IMAGE_COVERAGE_FOR_PARTIAL_OCR = 0.5;
+
+// ---- F8 (R4a Task 30): OCR provider `crm` -----------------------------
+//
+// Under CRM_API_URL the fork never runs its own OCR: the CRM already reads
+// every incoming document with its own two-tier Gemini OCR
+// (`ocrAttachment`, crm/src/lib/workflow/onboarding-tools.ts) and caches the
+// result in `extraction_records`, keyed by the file's sha256. This module
+// polls that cache (`GET /extractions/:sha256`, crm/src/lib/crm-mcp/extractions.ts)
+// instead of constructing a LiteParse parser, and never falls back to one —
+// a miss is a real "not read yet" state the engine's OCR step must resolve
+// first, not a signal to guess locally (design R4 §2.4).
+
+/** The CRM's `extraction_records` row for one file's bytes, as `GET /extractions/:sha256`
+ * returns it (`{ ...record, path }`, crm/src/lib/crm-mcp/extractions.ts:76). `path` is
+ * unused here — this fork already has the file at the `filePath` it was asked to parse. */
+export interface CrmExtraction {
+  sha256: string;
+  fields: Record<string, unknown>;
+  textLayer: string | null;
+  tier: string;
+  provenance: Record<string, unknown>;
+  path?: string | null;
+}
+
+export type CrmExtractionFetcher = (sha256: string) => Promise<CrmExtraction | null>;
+
+let crmExtractionSource: CrmExtractionFetcher | undefined;
+
+/** Wired once at connect time (create-server.ts) when CRM_API_URL is set, to
+ * `GET /extractions/:sha256` over the fork's CRM persistence client. */
+export function setCrmExtractionSource(fetcher: CrmExtractionFetcher): void {
+  crmExtractionSource = fetcher;
+}
+
+const NO_CRM_EXTRACTION_MESSAGE =
+  "no CRM extraction for this document yet — the engine's OCR step runs first, no fallback " +
+  "(the fork never runs its own OCR under CRM_API_URL)";
+
+function crmExtractionResultToParsedDocument(record: CrmExtraction): ParsedDocument {
+  if (record.textLayer === null) {
+    throw new Error(
+      `the CRM's extraction record for sha256 ${record.sha256} has no text layer yet — ` +
+      "the engine's OCR step runs first, no fallback",
+    );
+  }
+  const text = record.textLayer;
+  const result: ParseResult = {
+    totalPages: 1,
+    pages: [
+      { pageNum: 1, width: 0, height: 0, text, markdown: text, textItems: [] },
+    ],
+    pageErrors: [],
+    text,
+    images: [],
+    screenshots: [],
+    imageErrorCount: 0,
+  };
+  return { text, pageCount: 1, result, ocrPartialFailure: false };
+}
+
+async function parseDocumentViaCrm(filePath: string): Promise<ParsedDocument> {
+  const fetcher = crmExtractionSource;
+  if (!fetcher) {
+    throw new Error(
+      "CRM_API_URL is set but no CRM extraction source is wired — setCrmExtractionSource() " +
+      "must be called (create-server.ts) before parseDocument runs",
+    );
+  }
+  const bytes = await readFile(filePath);
+  const sha256 = createHash("sha256").update(bytes).digest("hex");
+  const record = await fetcher(sha256);
+  if (!record) {
+    throw new Error(NO_CRM_EXTRACTION_MESSAGE);
+  }
+  return crmExtractionResultToParsedDocument(record);
+}
 
 function isLoopbackHost(hostname: string): boolean {
   const normalized = hostname.trim().toLowerCase().replace(/^\[(.*)\]$/, "$1");
@@ -249,6 +327,9 @@ function detectOcrPartialFailure(complexity: ParsedDocumentComplexity, result: P
 }
 
 export async function parseDocument(filePath: string): Promise<ParsedDocument> {
+  if (process.env.CRM_API_URL?.trim()) {
+    return parseDocumentViaCrm(filePath);
+  }
   const complexity = summarizeComplexity(await analyzeDocumentComplexity(filePath));
   const parserForParse = !complexity.anyNeedsOcr
     ? getOcrDisabledDocumentParser()

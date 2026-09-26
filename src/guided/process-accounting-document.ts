@@ -245,7 +245,7 @@ export function registerProcessAccountingDocumentTool(
       items: jsonObjectArrayInput.optional().describe("Reviewed invoice items. In mode='prepare' their presence switches to booking-binding prepare (binds the exact write model and returns the create plan_handle); REQUIRED again unchanged in mode='create'."),
       vat_price: z.number().optional().describe("mode='create': EXACT total VAT from the invoice; never recalculate."),
       gross_price: z.number().optional().describe("mode='create': EXACT total gross from the invoice; never recalculate."),
-      liability_accounts_id: z.number().optional().describe("mode='create': liability account (default 2310)."),
+      liability_accounts_id: z.number().optional().describe("mode='create': liability account (default: the chart account with role `PAYABLE`)."),
       notes: z.string().optional().describe("mode='create': optional notes. Do NOT use the source document filename."),
       ref_number: z.string().optional().describe("mode='create': reference number."),
       bank_account_no: z.string().optional().describe("mode='create': supplier bank account."),

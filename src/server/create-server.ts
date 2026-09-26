@@ -16,7 +16,7 @@ import {
   type ToolExposureConfig,
 } from "../config.js";
 import { runWithExtra } from "../progress.js";
-import { HttpClient } from "../http-client.js";
+import { HttpClient, HttpError } from "../http-client.js";
 import { buildConnectionFingerprint } from "../connection-fingerprint.js";
 import { ClientsApi } from "../api/clients.api.js";
 import { ProductsApi } from "../api/products.api.js";
@@ -40,6 +40,7 @@ import { getAllowedRootsStartupWarning } from "../file-validation.js";
 import { initAuditLog, logAudit } from "../audit-log.js";
 import { serializeToolMutationError } from "../mutation-audit.js";
 import { initAccountingRulesConnection, initCrmRules, type AccountingAutoBookingRule, type CrmRuleEntry, type CrmRuleStatus } from "../accounting-rules.js";
+import { setCrmExtractionSource, type CrmExtraction } from "../document-parser.js";
 import { createPublicToolRegistrar } from "../public-tool-registrar.js";
 import { exposureForProfile, type ToolProfile } from "../tool-profile.js";
 import { buildServerInstructions } from "./server-instructions.js";
@@ -228,6 +229,24 @@ async function fetchCrmRulesSnapshot(client: HttpClient): Promise<CrmRuleEntry[]
 }
 
 /**
+ * F8 (R4a Task 30): the fork's `crm` OCR provider (`document-parser.ts`) polls
+ * the CRM's `GET /extractions/:sha256` instead of running LiteParse. A 404
+ * means no extraction record exists for those bytes yet — that is a real
+ * miss (`setCrmExtractionSource`'s caller treats it as "not read yet"), not
+ * an error; every other non-2xx status is a real failure and propagates.
+ */
+function fetchCrmExtraction(client: HttpClient): (sha256: string) => Promise<CrmExtraction | null> {
+  return async (sha256) => {
+    try {
+      return await client.get<CrmExtraction>(`/extractions/${sha256}`);
+    } catch (error) {
+      if (error instanceof HttpError && error.status === 404) return null;
+      throw error;
+    }
+  };
+}
+
+/**
  * F6: the sink `saveAutoBookingRule` writes a new/updated rule through in crm
  * mode — `PUT /rules/:key`, always `pending` server-side (Task 21's route
  * upsert). `judgmentIds` is required by that route's body validation; the
@@ -394,6 +413,11 @@ export async function createMcpServer(
     // fork/state/* and /judgments) since `rules` is a sibling top-level CRM
     // route, not nested under `fork/`.
     initCrmRules(rulesSnapshot, crmRulesSink(persistenceClient));
+    // F8 (Task 30): the crm OCR provider reads its extraction records through
+    // the same persistence client (same base URL/credentials as fork/state/*
+    // and /rules) since `extractions` is a sibling top-level CRM route, not
+    // nested under `fork/`.
+    setCrmExtractionSource(fetchCrmExtraction(persistenceClient));
     // Task 27: the fork's only judgments write path. Reuses the same
     // persistence client (same base URL/credentials as fork/state/*) since
     // `judgments` is a sibling top-level CRM route, not nested under `fork/`.

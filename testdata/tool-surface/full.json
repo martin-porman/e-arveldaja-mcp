@@ -2,12 +2,12 @@
   "profile": "full",
   "measurement": {
     "toolCount": 149,
-    "toolsListBytes": 156724,
+    "toolsListBytes": 156758,
     "descriptionsBytes": 21498,
-    "inputSchemasBytes": 99264,
+    "inputSchemasBytes": 99298,
     "largestTool": {
       "name": "process_accounting_document",
-      "bytes": 4718
+      "bytes": 4752
     },
     "serverInstructionsBytes": 932,
     "promptMetadataBytes": 11072,
@@ -5800,7 +5800,7 @@
             "type": "string"
           },
           "liability_accounts_id": {
-            "description": "mode='create': liability account (default 2310).",
+            "description": "mode='create': liability account (default: the chart account with role `PAYABLE`).",
             "type": "number"
           },
           "mode": {

@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { HttpError, type HttpClient } from "../http-client.js";
 import type { ApiFile, ApiResponse, PaginatedResponse } from "../types/api.js";
 import { Cache } from "../cache.js";
@@ -62,6 +63,33 @@ const MUTATION_ENTITY_BY_PATH = {
 const KNOWN_MUTATION_CACHE_PREFIXES = new Set<string>(
   Object.keys(MUTATION_ENTITY_BY_PATH),
 );
+
+/** The subset of the CRM's `GET /extractions/:sha256` body a document upload needs
+ * (crm/src/lib/crm-mcp/extractions.ts:76 — `{ ...record, path }`). */
+interface CrmExtractionLookup {
+  path: string | null;
+}
+
+/**
+ * Resolves the on-disk CRM attachment path for a document's exact bytes via
+ * the CRM's `GET /extractions/:sha256` (spec R4a Task 30), so `uploadDocument`
+ * never has to invent a path. `path` is `null` both when no extraction record
+ * exists yet (a 404) and when the record's own re-verified path came back
+ * null — either way the caller refuses rather than guessing.
+ */
+export async function resolveCrmExtractionPath(
+  client: HttpClient,
+  contents: string,
+): Promise<{ sha256: string; path: string | null }> {
+  const sha256 = createHash("sha256").update(Buffer.from(contents, "base64")).digest("hex");
+  try {
+    const record = await client.get<CrmExtractionLookup>(`/extractions/${sha256}`);
+    return { sha256, path: record.path ?? null };
+  } catch (error) {
+    if (error instanceof HttpError && error.status === 404) return { sha256, path: null };
+    throw error;
+  }
+}
 
 function safelyIsMutationIndeterminate(error: unknown): boolean {
   try {
@@ -478,8 +506,13 @@ export class BaseResource<T> {
   // is `POST /documents/:id/file` (crm/src/lib/crm-mcp/writes-documents.ts:267-298),
   // which records `{ fileRef, fileSha256 }` on a document that already has the bytes
   // on disk under CRM_MCP_ATTACHMENTS — there is no GET/DELETE for the file content at
-  // all, and no route this fork can call to learn the `path` up front (that lookup is
-  // Task 30's CRM-extraction-record mapping). All three methods below refuse honestly.
+  // all, so `getDocument`/`deleteDocument` below still refuse honestly.
+  //
+  // R4a Task 30 closes `uploadDocument`: the `path` that route needs is now
+  // learned from the CRM's own extraction record (`GET /extractions/:sha256`,
+  // resolved by the uploaded bytes' sha256 — the same OCR record F8's `crm`
+  // parser provider reads, `document-parser.ts`). A miss (no record yet, or a
+  // record with no re-verified `path`) still refuses rather than guessing.
 
   async getDocument(id: number): Promise<ApiFile> {
     if (this.documents) {
@@ -493,9 +526,20 @@ export class BaseResource<T> {
 
   async uploadDocument(id: number, name: string, contents: string): Promise<ApiResponse> {
     if (this.documents) {
-      throw new HttpError(
-        `${this.basePath}/${id}: POST /documents/:id/file needs a { path, sha256 } inside CRM_MCP_ATTACHMENTS (writes-documents.ts:255-283) — the fork has no source for that path until Task 30 wires the CRM extraction record`,
-        501, "PUT", `${this.basePath}/${id}/document_user`,
+      const { sha256, path } = await resolveCrmExtractionPath(this.client, contents);
+      if (!path) {
+        throw new HttpError(
+          `${this.basePath}/${id}: no CRM extraction record for this document's bytes (sha256 ${sha256}) yet — the engine's OCR step runs first, no fallback`,
+          404, "PUT", `${this.basePath}/${id}/document_user`,
+        );
+      }
+      const crmId = (await this.documentIdMap!.toCrm("document", [id]))[0]!;
+      return this.mutate(
+        "upload", id, `${this.basePath}:${id}:document_user`, [this.basePath],
+        async () => {
+          await this.client.post(`/documents/${crmId}/file`, { path, sha256 });
+          return { code: 200, messages: [] };
+        },
       );
     }
     return this.mutate(

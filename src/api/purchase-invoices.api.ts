@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { HttpError, type HttpClient } from "../http-client.js";
 import type { PurchaseInvoice, CreatePurchaseInvoiceData, ApiResponse } from "../types/api.js";
 import type { CreatePurchaseInvoiceRequest, UpdatePurchaseInvoiceRequest } from "../types/mutations.js";
-import { BaseResource } from "./base-resource.js";
+import { BaseResource, resolveCrmExtractionPath } from "./base-resource.js";
 import { roundMoney, parseVatRateDropdown } from "../money.js";
 import { IdMap } from "../crm/id-map.js";
 import { vatCodeFor } from "../crm/vat-map.js";
@@ -442,21 +442,30 @@ export class PurchaseInvoicesApi extends BaseResource<PurchaseInvoice> {
   /**
    * `POST /documents/:id/file` needs a `{ path, sha256 }` of a file the CRM already
    * has on disk under CRM_MCP_ATTACHMENTS (crm/src/lib/crm-mcp/writes-documents.ts:255-283).
-   * Finding: this fork has no route to learn that `path` — it comes from the CRM's
-   * extraction record, which Task 30 wires up. Hashing the caller's base64 `contents`
-   * now (so Task 30 only has to plug in the path) and refusing honestly rather than
-   * inventing a path. Consequence: every booking flow that uploads right after create
-   * (pdf-workflow.ts:1031, receipt-inbox-booking.ts:293, documents/operations.ts:575)
-   * will hit this 501 and roll back (invalidate) the invoice it just created, until
-   * Task 30 lands.
+   * `PurchaseInvoicesApi` does not opt into `BaseResource`'s document-backed mode (see the
+   * class-level finding above), so it resolves that `path` itself here rather than through
+   * the shared `this.documents` branch: `resolveCrmExtractionPath` hashes the caller's
+   * base64 `contents` and looks up the CRM's extraction record by that sha256 (spec R4a
+   * Task 30). A miss — no record yet, or a record with no re-verified path — refuses rather
+   * than inventing a path; every booking flow that uploads right after create
+   * (pdf-workflow.ts:1031, receipt-inbox-booking.ts:293, documents/operations.ts:575) then
+   * rolls back (invalidates) the invoice it just created, same as any other upload failure.
    */
   override async uploadDocument(id: number, _name: string, contents: string): Promise<ApiResponse> {
-    const sha256 = createHash("sha256").update(Buffer.from(contents, "base64")).digest("hex");
-    throw new HttpError(
-      `purchase_invoices/${id}: POST /documents/:id/file needs a { path, sha256 } inside CRM_MCP_ATTACHMENTS — ` +
-      `the fork has no source for that on-disk path until Task 30 wires the CRM extraction record ` +
-      `(sha256 of the given contents: ${sha256})`,
-      501, "PUT", `/purchase_invoices/${id}/document_user`,
+    const { sha256, path } = await resolveCrmExtractionPath(this.client, contents);
+    if (!path) {
+      throw new HttpError(
+        `purchase_invoices/${id}: no CRM extraction record for this document's bytes (sha256 ${sha256}) yet — the engine's OCR step runs first, no fallback`,
+        404, "PUT", `/purchase_invoices/${id}/document_user`,
+      );
+    }
+    const crmId = (await this.crmIdMap.toCrm("document", [id]))[0]!;
+    return this.mutate(
+      "upload", id, `${this.basePath}:${id}:document_user`, [this.basePath],
+      async () => {
+        await this.client.post(`/documents/${crmId}/file`, { path, sha256 });
+        return { code: 200, messages: [] };
+      },
     );
   }
 }
