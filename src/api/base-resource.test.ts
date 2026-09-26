@@ -1018,10 +1018,16 @@ describe("BaseResource", () => {
     // ProductsApi is excluded here: its update() is switched off (spec §2.3,
     // "the catalogue is maintained in the CRM") and never reaches the network
     // layer at all, so it cannot be "ambiguous" — covered by its own test below.
+    //
+    // TransactionsApi (Task 24) is excluded the same way: the CRM has no route
+    // to update a bank transaction's metadata, so its update() now also
+    // refuses immediately with a 501 and never reaches the network layer —
+    // covered by transactions.api.test.ts "update throws" instead. Widened
+    // here (Task 24) because this row previously asserted the old RIK
+    // PATCH-and-recover behaviour transactions.api.ts no longer has.
     it.each([
       [ClientsApi, "/clients", "client"],
       [JournalsApi, "/journals", "journal"],
-      [TransactionsApi, "/transactions", "transaction"],
       [SaleInvoicesApi, "/sale_invoices", "sale_invoice"],
       [PurchaseInvoicesApi, "/purchase_invoices", "purchase_invoice"],
     ] as const)("M01 maps inherited ambiguity for %s to singular %s metadata", async (Api, path, entity) => {
@@ -1030,6 +1036,16 @@ describe("BaseResource", () => {
       // ClientsApi.update resolves the numeric id to a CRM counterparty id via
       // POST /id-map before it PATCHes /counterparties/:id.
       if ((Api as unknown) === ClientsApi) vi.mocked(client.post).mockResolvedValue({ crmIds: ["5"] });
+      // JournalsApi.update (Task 24) resolves id 5 to a CRM document id, reads
+      // that document back (PATCH /documents/:crmId needs the full draft, not
+      // a partial), and only then PATCHes — mock both round trips.
+      if ((Api as unknown) === JournalsApi) {
+        vi.mocked(client.post).mockResolvedValue({ crmIds: ["doc5"] });
+        vi.mocked(client.get).mockResolvedValue({
+          id: "doc5", kind: "MEMO", counterpartyId: null, docDate: "2026-01-01", turnoverDate: "2026-01-01",
+          dueDate: null, description: "", sourceKey: "manual:x", creditsDocumentId: null, lines: [],
+        });
+      }
       vi.mocked(client.patch).mockRejectedValueOnce(
         new HttpError("network ambiguity", "network", "PATCH", `${path}/5`),
       );
