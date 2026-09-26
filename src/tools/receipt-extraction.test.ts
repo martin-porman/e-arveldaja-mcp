@@ -25,8 +25,11 @@ import {
   mergeLayoutAmounts,
   suggestBookingInternal,
   categorizeTransactionGroup,
+  extractReceiptFieldsFromCrmFields,
+  shouldUseCrmFields,
 } from "./receipt-extraction.js";
 import type { ExtractedAmountsWithMetadata } from "./receipt-extraction.js";
+import type { CrmParsedFields } from "../document-parser.js";
 
 describe("bank transaction source direction classification", () => {
   it("classifies API type C with signed incoming metadata as revenue, not an expense", () => {
@@ -2056,5 +2059,74 @@ describe("computeMinOcrConfidence — small-sample robust minimum (Codex review 
     // Only 2 robust (>=3 char) items -> small-sample branch, but the min must be
     // taken over robust values (0.85), NOT the unfiltered min (0.10 noise).
     expect(computeMinOcrConfidence(items)).toBe(0.85);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// E2E-FIX B2: the CRM's own structured OCR fields, mapped directly (no text layer)
+// ---------------------------------------------------------------------------
+
+describe("extractReceiptFieldsFromCrmFields — the Kesko live-record example (E2E-FIX B2)", () => {
+  const keskoFields: CrmParsedFields = {
+    fields: {
+      supplierName: "AS Kesko Senukai Estonia",
+      supplierRegNo: "10026621",
+      supplierVatNumber: "EE100269136",
+      invoiceNumber: "E309 20260103 04 084460",
+      amount: 18.60,
+      netAmount: 14.99,
+      vatAmount: 3.60,
+      currency: "EUR",
+      invoiceDate: "2026-01-03",
+      lineItems: [
+        { description: "Item one", quantity: 1, unit: null, unitPrice: 5, vatRatePercent: 24, lineTotal: 5 },
+        { description: "Item two", quantity: 1, unit: null, unitPrice: 9.99, vatRatePercent: 24, lineTotal: 9.99 },
+      ],
+      sourceText: "AS Kesko Senukai Estonia\nE309 20260103 04 084460\nKokku 18.60 EUR",
+      confidence: "medium",
+    },
+    tier: "2",
+    confidence: "medium",
+  };
+
+  it("maps supplier, invoice, totals and currency straight from the CRM's fields (no re-derivation)", () => {
+    const extracted = extractReceiptFieldsFromCrmFields(keskoFields, "receipt.jpg");
+    expect(extracted).toMatchObject({
+      supplier_name: "AS Kesko Senukai Estonia",
+      supplier_reg_code: "10026621",
+      supplier_vat_no: "EE100269136",
+      invoice_number: "E309 20260103 04 084460",
+      invoice_date: "2026-01-03",
+      total_net: 14.99,
+      total_vat: 3.60,
+      // 14.99 + 3.60 = 18.59, one cent short of the CRM's own 18.60 — total_gross
+      // is read from `fields.amount` directly, never derived from net + vat.
+      total_gross: 18.60,
+      vat_explicit: true,
+      currency: "EUR",
+      raw_text: "AS Kesko Senukai Estonia\nE309 20260103 04 084460\nKokku 18.60 EUR",
+    });
+    // Tier 2 → not "high" → the shared low-confidence signal fires downstream.
+    expect(extracted.min_ocr_confidence).toBeLessThan(0.6);
+  });
+
+  it("a high-confidence tier 1 read sets no low-confidence signal", () => {
+    const tier1: CrmParsedFields = { ...keskoFields, tier: "1", confidence: "high", fields: { ...keskoFields.fields, confidence: "high" } };
+    const extracted = extractReceiptFieldsFromCrmFields(tier1, "receipt.jpg");
+    expect(extracted.min_ocr_confidence).toBeUndefined();
+  });
+});
+
+describe("shouldUseCrmFields — dispatch predicate (E2E-FIX B2)", () => {
+  it("is true only with no usable text AND CRM fields present", () => {
+    const crmFields: CrmParsedFields = {
+      fields: { supplierName: "AS Kesko Senukai Estonia" },
+      tier: "2",
+      confidence: "medium",
+    };
+    expect(shouldUseCrmFields({ text: "", crmFields })).toBe(true);
+    expect(shouldUseCrmFields({ text: "   ", crmFields })).toBe(true);
+    expect(shouldUseCrmFields({ text: "Arve nr A-17", crmFields })).toBe(false);
+    expect(shouldUseCrmFields({ text: "" })).toBe(false);
   });
 });

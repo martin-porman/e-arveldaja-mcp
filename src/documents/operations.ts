@@ -15,8 +15,10 @@ import { parseDocument } from "../document-parser.js";
 import type { LayoutTextItem } from "../document-identifiers.js";
 import {
   computeMinOcrConfidence,
+  extractReceiptFieldsFromCrmFields,
   extractReceiptFieldsFromText,
   inferSupplierCountry,
+  shouldUseCrmFields,
   LOW_OCR_CONFIDENCE_THRESHOLD,
   type ExtractedReceiptFields,
 } from "../tools/receipt-extraction.js";
@@ -299,11 +301,13 @@ class AccountingDocumentOperationsImpl implements AccountingDocumentOperations {
         // Offline / unconfigured — extract without self-exclusions.
       }
 
-      const extracted = extractReceiptFieldsFromText(parsedDocument.text, material.fileName, {
-        textItems: allTextItems,
-        ownCompanyVat,
-        ownCompanyRegistryCode,
-      });
+      const extracted = shouldUseCrmFields(parsedDocument)
+        ? extractReceiptFieldsFromCrmFields(parsedDocument.crmFields, material.fileName)
+        : extractReceiptFieldsFromText(parsedDocument.text, material.fileName, {
+            textItems: allTextItems,
+            ownCompanyVat,
+            ownCompanyRegistryCode,
+          });
 
       const signals: ExtractionConfidenceSignals = {};
       if (parsedDocument.ocrPartialFailure) signals.partial_ocr_failure = true;

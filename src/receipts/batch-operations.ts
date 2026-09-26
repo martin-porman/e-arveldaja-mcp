@@ -23,8 +23,10 @@ import {
   classifyReceiptDocument,
   computeMinOcrConfidence,
   detectReverseChargeFromText,
+  extractReceiptFieldsFromCrmFields,
   extractReceiptFieldsFromText,
   hasAutoBookableReceiptFields,
+  shouldUseCrmFields,
   inferSupplierCountry,
   LOW_OCR_CONFIDENCE_THRESHOLD,
   normalizeCounterpartyName,
@@ -323,6 +325,9 @@ async function extractReceiptFields(
       pageNum: page.pageNum,
     }))
   );
+  if (shouldUseCrmFields(parsedDocument)) {
+    return extractReceiptFieldsFromCrmFields(parsedDocument.crmFields, snapshot.file.name);
+  }
   return extractReceiptFieldsFromText(parsedDocument.text, snapshot.file.name, {
     ownCompanyVat,
     ownCompanyRegistryCode,

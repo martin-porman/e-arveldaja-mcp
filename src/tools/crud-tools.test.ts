@@ -2147,56 +2147,45 @@ describe("H05 correction tool inventory and workflow", () => {
     }));
   });
 
-  it.each([
-    {
-      label: "PROJECT to CONFIRMED",
-      drift: { status: "CONFIRMED" },
-      code: "correction_invoice_not_project",
-      error: "Purchase invoice totals correction requires a PROJECT draft.",
-      nextAction: "Fetch the invoice; if it is confirmed, invalidate it explicitly, then request and approve a new correction preview.",
-    },
-    {
-      label: "EUR to USD",
-      drift: { cl_currencies_id: "USD" },
-      code: "correction_currency_not_supported",
-      error: "Automatic purchase invoice totals correction supports EUR invoices only.",
-      nextAction: "Review the currency and base totals manually; do not use automatic totals correction.",
-    },
-  ] as const)("real public preview/apply rejects fresh $label drift without PATCH or audit", async ({ drift, code, error, nextAction }) => {
-    const initialInvoice = {
-      id: 7,
-      clients_id: 10,
-      client_name: "Supplier OÜ",
-      number: "PI-7",
-      create_date: "2026-03-01",
-      journal_date: "2026-03-01",
-      term_days: 0,
-      status: "PROJECT",
-      cl_currencies_id: "EUR",
-      net_price: 100,
-      vat_price: 23.99,
-      gross_price: 123.99,
-      currency_rate: 1,
-      base_net_price: 100,
-      base_vat_price: 23.99,
-      base_gross_price: 123.99,
-      items: [{
-        id: 11,
-        custom_title: "Consulting",
-        purchase_accounts_id: 5230,
-        amount: 1,
-        total_net_price: 100,
-        vat_amount: 24,
-        vat_rate_dropdown: "24",
+  // E2E-FIX B1: PurchaseInvoicesApi is document-backed now (get/update read
+  // through `/documents/:id`, purchase-invoices.api.ts), so `client.get` here
+  // must return `CrmDocument` rows, not the old flat `PurchaseInvoice` shape,
+  // and a numeric id needs a `client.post("/id-map", ...)` round trip to
+  // resolve the CRM document id before either `get` call.
+  //
+  // Finding: `cl_currencies_id` is now hardcoded `"EUR"` on every CRM-backed
+  // read (`fromDocument`, purchase-invoices.api.ts — a `CrmDocument` carries
+  // no currency field at all) — a live invoice can no longer drift from EUR
+  // to USD between preview and confirm, so the old "EUR to USD" case here is
+  // untestable through a real read any more; `correction_currency_not_supported`
+  // stays defensive dead code for a document-backed invoice, covered instead
+  // by `buildTotalsCorrectionPreview`'s own unit tests, if any, over a
+  // hand-built `PurchaseInvoice`. The "PROJECT to CONFIRMED" drift is
+  // unaffected: `doc.status` still flows straight through `fromDocument`.
+  it("real public preview/apply rejects a fresh PROJECT-to-CONFIRMED drift without PATCH or audit", async () => {
+    const crmDocId = "doc-7";
+    const code = "correction_invoice_not_project";
+    const initialDoc = {
+      id: crmDocId, kind: "PURCHASE_INVOICE", status: "DRAFT", number: "PI-7",
+      counterpartyId: null, docDate: "2026-03-01", turnoverDate: "2026-03-01", dueDate: null,
+      description: "", sourceKey: "manual:x", creditsDocumentId: null,
+      lines: [{
+        description: "Consulting", quantity: "1", unitPrice: "100.00", net: "100.00",
+        side: null, vatCode: "P24", vatAmount: "24.00", accountCode: "5230", dimensionId: null,
       }],
     };
     const get = vi.fn()
-      .mockResolvedValueOnce(initialInvoice)
-      .mockResolvedValueOnce({ ...initialInvoice, ...drift });
+      .mockResolvedValueOnce(initialDoc)
+      .mockResolvedValueOnce({ ...initialDoc, status: "POSTED" });
+    const post = vi.fn(async (path: string, body: { kind?: string }) => {
+      if (path === "/id-map" && body.kind === "document") return { crmIds: [crmDocId] };
+      throw new Error(`unexpected POST ${path} ${JSON.stringify(body)}`);
+    });
     const patch = vi.fn().mockResolvedValue({ code: 200, messages: [] });
     const purchaseInvoices = new PurchaseInvoicesApi({
       cacheNamespace: `h05-public-${code}`,
       get,
+      post,
       patch,
     } as never);
     const server = { registerTool: vi.fn() };
@@ -2234,12 +2223,12 @@ describe("H05 correction tool inventory and workflow", () => {
     expect(parseMcpResponse(confirmResult.content[0]!.text)).toEqual({
       category: "purchase_invoice_totals_correction",
       code,
-      error,
-      next_action: nextAction,
+      error: "Purchase invoice totals correction requires a PROJECT draft.",
+      next_action: "Fetch the invoice; if it is confirmed, invalidate it explicitly, then request and approve a new correction preview.",
     });
     expect(get).toHaveBeenCalledTimes(2);
-    expect(get).toHaveBeenNthCalledWith(1, "/purchase_invoices/7");
-    expect(get).toHaveBeenNthCalledWith(2, "/purchase_invoices/7");
+    expect(get).toHaveBeenNthCalledWith(1, `/documents/${crmDocId}`);
+    expect(get).toHaveBeenNthCalledWith(2, `/documents/${crmDocId}`);
     expect(patch).not.toHaveBeenCalled();
     expect(logAudit).not.toHaveBeenCalled();
   });

@@ -15,6 +15,7 @@ import {
 } from "../document-identifiers.js";
 import { hasConfidentInvoiceNumber } from "../invoice-extraction-fallback.js";
 import { wrapUntrustedOcr } from "../mcp-json.js";
+import type { CrmParsedFields } from "../document-parser.js";
 import type { Account, PurchaseInvoiceItem, Transaction } from "../types/api.js";
 import { normalizeVatRate } from "./purchase-vat-defaults.js";
 import { bankTransactionDirection } from "../bank-transaction-direction.js";
@@ -2585,6 +2586,86 @@ export function hasAutoBookableReceiptFields(
     extracted.total_gross !== undefined &&
     hasConfidentInvoiceNumber(extracted.invoice_number),
   );
+}
+
+function crmStr(value: unknown): string | undefined {
+  return typeof value === "string" && value.trim() !== "" ? value : undefined;
+}
+
+function crmNum(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+/**
+ * E2E-FIX B2: maps the CRM's own structured OCR fields (its two-tier Gemini
+ * read, `crm/src/lib/invoice/invoice-ocr.ts` `InvoiceExtraction`) straight onto
+ * `ExtractedReceiptFields` — used only when there is no usable text to run the
+ * heuristic `extractReceiptFieldsFromText` parser over (an image receipt with
+ * `textLayer: null`). Fields the model already resolved (supplier identity,
+ * dates, totals) are read as-is, never re-derived: e.g. `total_gross` is
+ * `fields.amount` directly, not `net + vat` (the two can differ by a cent from
+ * real-world rounding on the source document).
+ */
+export function extractReceiptFieldsFromCrmFields(
+  crmFields: CrmParsedFields,
+  _fileName: string,
+): ExtractedReceiptFields {
+  const f = crmFields.fields;
+  const lineItems = Array.isArray(f.lineItems) ? (f.lineItems as unknown[]) : [];
+  const lineDescriptions = lineItems
+    .map((item) => crmStr((item as Record<string, unknown> | null)?.description))
+    .filter((description): description is string => description !== undefined);
+  const vatAmount = crmNum(f.vatAmount);
+  const confidence = crmFields.confidence;
+
+  return {
+    supplier_name: crmStr(f.supplierName),
+    supplier_reg_code: crmStr(f.supplierRegNo),
+    supplier_vat_no: crmStr(f.supplierVatNumber),
+    supplier_iban: crmStr(f.supplierIban),
+    invoice_number: crmStr(f.invoiceNumber),
+    ref_number: crmStr(f.referenceNumber),
+    invoice_date: crmStr(f.invoiceDate),
+    due_date: crmStr(f.dueDate),
+    total_net: crmNum(f.netAmount),
+    total_vat: vatAmount,
+    total_gross: crmNum(f.amount),
+    ...(vatAmount !== undefined ? { vat_explicit: true } : {}),
+    currency: crmStr(f.currency),
+    description: lineDescriptions.length > 0 ? lineDescriptions.join("; ") : undefined,
+    // `sourceText` is the document's own text as the model read it — the OCR
+    // transcription of the image, not the model's structured answer
+    // (invoice-ocr.ts: "the OCR transcription when there was none [text layer]").
+    // Real evidence, not fabricated: used for classification and for the
+    // review-guidance raw_text field, same as the text-parsed path.
+    raw_text: crmStr(f.sourceText),
+    // Mirrors the CRM's own composed confidence (`ocrConfidence()`,
+    // onboarding-tools.ts:198): "high" needs no flag; tier 2 or a failed check
+    // ("medium"/"low") is mapped below the shared LOW_OCR_CONFIDENCE_THRESHOLD
+    // so processSingleReceipt's existing low_ocr_confidence signal fires the
+    // same way it would for a low-confidence text-parsed read.
+    ...(confidence !== undefined && confidence !== "high" ? { min_ocr_confidence: 0.5 } : {}),
+    extraction_notes: [
+      `Fields read directly from the CRM's own OCR (tier ${crmFields.tier}${confidence ? `, confidence ${confidence}` : ""}); not re-parsed from text.`,
+    ],
+  };
+}
+
+/**
+ * E2E-FIX B2: true only when a `ParsedDocument` has no usable text but does
+ * carry the CRM's own structured fields (an image with `textLayer: null`,
+ * `crmFields` set by `crmExtractionResultToParsedDocument`, document-parser.ts).
+ * Every `parseDocument()` caller (batch-operations.ts, documents/operations.ts,
+ * pdf-workflow.ts) calls this to choose between `extractReceiptFieldsFromCrmFields`
+ * and the existing `extractReceiptFieldsFromText` itself — kept as a plain
+ * predicate, not a wrapper that calls `extractReceiptFieldsFromText` internally,
+ * so callers keep importing `extractReceiptFieldsFromText` directly (tests that
+ * mock it at the module boundary, e.g. batch-operations.test.ts, keep working).
+ */
+export function shouldUseCrmFields(
+  parsedDocument: { text: string; crmFields?: CrmParsedFields },
+): parsedDocument is { text: string; crmFields: CrmParsedFields } {
+  return !parsedDocument.text.trim() && !!parsedDocument.crmFields;
 }
 
 export function extractReceiptFieldsFromText(

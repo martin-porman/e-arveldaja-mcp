@@ -67,6 +67,55 @@ describe("PurchaseInvoicesApi over the CRM", () => {
   });
 });
 
+describe("PurchaseInvoicesApi.listAll over the CRM (E2E-FIX B1)", () => {
+  it("reads GET /documents?kind=PURCHASE_INVOICE (and PURCHASE_CREDIT), paged {items,page,pages}, and maps to PurchaseInvoice", async () => {
+    const calls: { method: string; url: string }[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (url: string, init: RequestInit) => {
+      const urlStr = String(url);
+      calls.push({ method: String(init?.method ?? "GET"), url: urlStr });
+      if (urlStr.includes("/documents?") && urlStr.includes("kind=PURCHASE_INVOICE")) {
+        return json({
+          items: [{
+            id: "doc-9", kind: "PURCHASE_INVOICE", status: "DRAFT", number: "A-1",
+            counterpartyId: "ck-supplier", docDate: "2026-02-03", turnoverDate: "2026-02-03", dueDate: "2026-02-17",
+            description: "", sourceKey: "file:abc", creditsDocumentId: null,
+            lines: [{
+              description: "Hosting", quantity: "1", unitPrice: "100.00", net: "100.00",
+              side: null, vatCode: "P24", vatAmount: "24.00", accountCode: "4000", dimensionId: null,
+            }],
+          }],
+          page: 1, pages: 1,
+        });
+      }
+      if (urlStr.includes("/documents?") && urlStr.includes("kind=PURCHASE_CREDIT")) {
+        return json({ items: [], page: 1, pages: 1 });
+      }
+      if (urlStr.endsWith("/id-map")) {
+        const body = init?.body ? JSON.parse(String(init.body)) : {};
+        if (body.kind === "counterparty") return json({ numericIds: [12] });
+        if (body.kind === "document") return json({ numericIds: [9] });
+        throw new Error(`unexpected id-map kind ${String(body.kind)}`);
+      }
+      throw new Error(`unexpected ${String(init?.method ?? "GET")} ${urlStr}`);
+    }));
+
+    const invoices = await new PurchaseInvoicesApi(client()).listAll();
+
+    expect(invoices).toHaveLength(1);
+    expect(invoices[0]).toMatchObject({
+      id: 9, clients_id: 12, number: "A-1", status: "PROJECT",
+      net_price: 100, vat_price: 24, gross_price: 124, term_days: 14,
+      items: [expect.objectContaining({
+        custom_title: "Hosting", total_net_price: 100, vat_amount: 24,
+        purchase_accounts_id: 4000, crm_vat_code: "P24",
+      })],
+    });
+    expect(calls.some((c) => c.url.includes("/documents?") && c.url.includes("kind=PURCHASE_INVOICE"))).toBe(true);
+    expect(calls.some((c) => c.url.includes("/documents?") && c.url.includes("kind=PURCHASE_CREDIT"))).toBe(true);
+    expect(calls.every((c) => !c.url.includes("/purchase_invoices"))).toBe(true);
+  });
+});
+
 describe("SaleInvoicesApi over the CRM", () => {
   it("switches outbound e-invoicing off honestly", async () => {
     await expect(new SaleInvoicesApi(client()).sendEinvoice(1, {} as never)).rejects.toThrow(/switched off/);

@@ -47,14 +47,31 @@ const NO_CRM_EXTRACTION_MESSAGE =
   "no CRM extraction for this document yet — the engine's OCR step runs first, no fallback " +
   "(the fork never runs its own OCR under CRM_API_URL)";
 
+/** True for a non-empty structured-fields object — an empty `{}` (a record whose
+ * OCR read yielded nothing at all) counts the same as absent, never as "present". */
+function hasStructuredFields(fields: Record<string, unknown> | null | undefined): fields is Record<string, unknown> {
+  return !!fields && typeof fields === "object" && Object.keys(fields).length > 0;
+}
+
+/** E2E-FIX B2: 23 of 41 live CRM extraction records carry `textLayer: null` (an
+ * image receipt, no PDF text layer) but full structured `fields` from the CRM's
+ * own two-tier Gemini OCR (crm/src/lib/ocr-tier-manager.ts, crm/src/lib/invoice/invoice-ocr.ts) —
+ * `processSingleReceipt` (batch-operations.ts) turned that into `status: "failed"`
+ * because this function refused on `textLayer === null` alone. It now refuses
+ * only when there is truly nothing to read: no text layer AND no structured
+ * fields. `receipt-extraction.ts`'s `extractReceiptFieldsFromParsedDocument`
+ * reads `crmFields` off the returned `ParsedDocument` to map the CRM's own
+ * fields straight into `ExtractedReceiptFields`, skipping the heuristic
+ * text-based extractor entirely when there is no text to run it on. */
 function crmExtractionResultToParsedDocument(record: CrmExtraction): ParsedDocument {
-  if (record.textLayer === null) {
+  const structuredFields = hasStructuredFields(record.fields) ? record.fields : undefined;
+  if (record.textLayer === null && !structuredFields) {
     throw new Error(
       `the CRM's extraction record for sha256 ${record.sha256} has no text layer yet — ` +
       "the engine's OCR step runs first, no fallback",
     );
   }
-  const text = record.textLayer;
+  const text = record.textLayer ?? "";
   const result: ParseResult = {
     totalPages: 1,
     pages: [
@@ -66,7 +83,11 @@ function crmExtractionResultToParsedDocument(record: CrmExtraction): ParsedDocum
     screenshots: [],
     imageErrorCount: 0,
   };
-  return { text, pageCount: 1, result, ocrPartialFailure: false };
+  const confidence = typeof record.provenance?.confidence === "string" ? record.provenance.confidence : undefined;
+  return {
+    text, pageCount: 1, result, ocrPartialFailure: false,
+    ...(structuredFields ? { crmFields: { fields: structuredFields, tier: record.tier, confidence } } : {}),
+  };
 }
 
 async function parseDocumentViaCrm(filePath: string): Promise<ParsedDocument> {
@@ -125,12 +146,32 @@ export interface ParsedDocumentComplexity {
   anyGarbled: boolean;
 }
 
+/** The CRM's own structured OCR read for one extraction record (E2E-FIX B2),
+ * carried on `ParsedDocument` so a caller with no usable text (an image with
+ * `textLayer: null`) can map these fields directly instead of running the
+ * heuristic text extractor over an empty string. `fields` keys are the CRM's
+ * `InvoiceExtraction` shape (crm/src/lib/invoice/invoice-ocr.ts): supplierName,
+ * supplierRegNo, supplierVatNumber, supplierIban, invoiceNumber,
+ * referenceNumber, amount, netAmount, vatAmount, vatRatePercent, currency,
+ * invoiceDate, dueDate, lineItems, sourceText, confidence, notes. */
+export interface CrmParsedFields {
+  fields: Record<string, unknown>;
+  tier: string;
+  /** The CRM's own composed confidence (`ocrConfidence()`, onboarding-tools.ts:198:
+   * tier 1 + every check passed → "high"; tier 2, or a failed check → lower),
+   * read off the extraction record's `provenance.confidence` — never the
+   * model's own self-reported `fields.confidence` (invoice-ocr.ts:750: "never
+   * from the model's own self-report"). */
+  confidence?: string;
+}
+
 export interface ParsedDocument {
   text: string;
   pageCount: number;
   result: ParseResult;
   complexity?: ParsedDocumentComplexity;
   ocrPartialFailure?: boolean;
+  crmFields?: CrmParsedFields;
 }
 
 function readBooleanEnv(name: string, defaultValue: boolean): boolean {

@@ -21,7 +21,7 @@ import { ROLE_FOR_CONSTANT, roleAccount } from "../crm/role-map.js";
 import { parseDocument } from "../document-parser.js";
 import { isValidEeRegistryCode, isValidEeVatNumber, type LayoutTextItem } from "../document-identifiers.js";
 import { summarizeInvoiceExtraction } from "../invoice-extraction-fallback.js";
-import { computeMinOcrConfidence, extractReceiptFieldsFromText, inferSupplierCountry, toIsoDate, LOW_OCR_CONFIDENCE_THRESHOLD, type FieldProvenance, type ExtractedReceiptFields } from "./receipt-extraction.js";
+import { computeMinOcrConfidence, extractReceiptFieldsFromCrmFields, extractReceiptFieldsFromText, inferSupplierCountry, shouldUseCrmFields, toIsoDate, LOW_OCR_CONFIDENCE_THRESHOLD, type FieldProvenance, type ExtractedReceiptFields } from "./receipt-extraction.js";
 import type { ExtractionConfidenceSignals } from "../invoice-extraction-fallback.js";
 import { resolveSupplierInternal } from "./supplier-resolution.js";
 import { resolveOwnCompanyIdentifiers } from "./own-company-identity.js";
@@ -420,11 +420,13 @@ export function registerPdfWorkflowTools(server: McpServer, api: ApiContext): vo
         } catch {
           // Offline / unconfigured connection — extract without self-exclusions.
         }
-        const extracted = extractReceiptFieldsFromText(parsedDocument.text, snapshot.fileName, {
-          textItems: allTextItems,
-          ownCompanyVat,
-          ownCompanyRegistryCode,
-        });
+        const extracted = shouldUseCrmFields(parsedDocument)
+          ? extractReceiptFieldsFromCrmFields(parsedDocument.crmFields, snapshot.fileName)
+          : extractReceiptFieldsFromText(parsedDocument.text, snapshot.fileName, {
+              textItems: allTextItems,
+              ownCompanyVat,
+              ownCompanyRegistryCode,
+            });
         // `extractReceiptFieldsFromText` already ran `extractIdentifiers` on the
         // same text + textItems and spread the result onto `extracted`; reuse
         // those identifiers rather than recomputing them (#14).

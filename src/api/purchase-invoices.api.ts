@@ -1,11 +1,11 @@
 import { createHash } from "node:crypto";
 import { HttpError, type HttpClient } from "../http-client.js";
-import type { PurchaseInvoice, CreatePurchaseInvoiceData, ApiResponse } from "../types/api.js";
+import type { PurchaseInvoice, PurchaseInvoiceItem, CreatePurchaseInvoiceData, ApiResponse } from "../types/api.js";
 import type { CreatePurchaseInvoiceRequest, UpdatePurchaseInvoiceRequest } from "../types/mutations.js";
-import { BaseResource, resolveCrmExtractionPath } from "./base-resource.js";
+import { BaseResource, type CrmDocument, type CrmDocumentLine } from "./base-resource.js";
 import { roundMoney, parseVatRateDropdown } from "../money.js";
 import { IdMap } from "../crm/id-map.js";
-import { vatCodeFor } from "../crm/vat-map.js";
+import { VAT_MAP, vatCodeFor } from "../crm/vat-map.js";
 import { sourceKeyFor } from "../crm/source-key.js";
 import type { CrmCounterparty } from "../crm/mappers.js";
 
@@ -27,6 +27,29 @@ function addDaysUtc(dateStr: string, days: number): string {
 function todayTallinn(): string {
   return new Date().toLocaleDateString("en-CA", { timeZone: "Europe/Tallinn" });
 }
+
+function daysBetweenUtc(fromDate: string, toDate: string): number {
+  const [fy, fm, fd] = fromDate.split("-").map(Number) as [number, number, number];
+  const [ty, tm, td] = toDate.split("-").map(Number) as [number, number, number];
+  const from = Date.UTC(fy, fm - 1, fd);
+  const to = Date.UTC(ty, tm - 1, td);
+  return Math.round((to - from) / 86_400_000);
+}
+
+/** `P24` → `24`, a reverse-charge or unmapped code → `0` — mirrors
+ * `SaleInvoicesApi`'s `rateFromVatCode` (sale-invoices.api.ts): only a
+ * `vatCodeFor`-produced code is ever stored, so this only sees an unknown
+ * code for a document this fork itself never wrote. */
+function rateFromVatCode(code: string | null): number {
+  if (!code) return 0;
+  const row = VAT_MAP.find((r) => r.code === code);
+  return row ? Number(row.rate) : 0;
+}
+
+type CrmLine = {
+  description: string; quantity: string | null; unitPrice: string | null; net: string;
+  side: null; vatCode: string; vatAmount: string; accountCode: string; dimensionId: string | null;
+};
 
 type CrmDraftDocument = { status: "DRAFT" | "POSTED" | "REVERSED" };
 
@@ -163,21 +186,196 @@ export class PurchaseInvoicesApi extends BaseResource<PurchaseInvoice> {
   private readonly crmIdMap: IdMap;
 
   constructor(client: HttpClient) {
-    super(client, "/purchase_invoices");
+    super(client, "/purchase_invoices", { kinds: ["PURCHASE_INVOICE", "PURCHASE_CREDIT"] });
     this.crmIdMap = new IdMap(client);
   }
 
-  // Narrow the create/update boundary from `Partial<PurchaseInvoice>` to request
-  // types that omit server-managed fields (id, status, payment_status,
-  // journals/settlements/transactions back-refs, …). Delegates to the base
-  // mutate/cache logic; the internal createAndSetTotals / confirmWithTotals paths
-  // call through these overrides unchanged.
+  /** `list`/`get`/`delete`/the `document_user` family now come from
+   * `BaseResource`'s document-backed opt-in (base-resource.ts), following
+   * `SaleInvoicesApi`'s pattern (sale-invoices.api.ts). This class still
+   * supplies `fromDocument`, `create` (routed through `createAndSetTotals`,
+   * the only write shape the CRM's single `POST /documents` supports) and
+   * `update` (the CRM's `PATCH /documents/:id` needs the full draft read
+   * back first, so it cannot be the generic `BaseResource.update`). */
   override async create(data: CreatePurchaseInvoiceRequest): Promise<ApiResponse> {
-    return super.create(data);
+    const result = await this.createAndSetTotals(data);
+    return { code: 200, created_object_id: result.created_object_id, messages: [] };
   }
 
+  /** Finding: a `CrmDocument` carries no counterparty name, and `fromDocument`
+   * is called synchronously (per row, no extra network round trip) — `client_name`
+   * (required on `PurchaseInvoice`) is left `""`. `findDuplicateInvoice`
+   * (receipt-inbox-matching.ts:51-95) and `suggestBookingInternal`
+   * (receipt-extraction.ts:2696-2787) never read it; display-only consumers
+   * that do (receipt-inbox.ts:915, receipt-extraction.ts:2675,
+   * wise/projection.ts:711, match-score.ts:126, aging-analysis.ts,
+   * financial-statements.ts, document-audit.ts) degrade the same way
+   * `SaleInvoicesApi.fromDocument` already leaves `client_name` unset for a
+   * sale invoice (sale-invoices.api.ts) — not a new gap, the same one T25
+   * already shipped for sales. */
+  protected override fromDocument(doc: CrmDocument, id: number, clientsId: number | null): PurchaseInvoice {
+    const netTotal = roundMoney(doc.lines.reduce((s, l) => s + Number(l.net), 0));
+    const vatTotal = roundMoney(doc.lines.reduce((s, l) => s + Number(l.vatAmount), 0));
+    return {
+      id,
+      clients_id: clientsId ?? 0,
+      client_name: "",
+      number: doc.number,
+      create_date: doc.docDate,
+      journal_date: doc.turnoverDate,
+      status: doc.status === "DRAFT" ? "PROJECT" : doc.status === "POSTED" ? "CONFIRMED" : "INVALIDATED",
+      net_price: netTotal,
+      vat_price: vatTotal,
+      gross_price: roundMoney(netTotal + vatTotal),
+      term_days: doc.dueDate ? daysBetweenUtc(doc.docDate, doc.dueDate) : 0,
+      notes: doc.description || null,
+      cl_currencies_id: "EUR",
+      items: doc.lines.map((l) => this.itemFromLine(l)),
+    };
+  }
+
+  /** Finding: a CRM document line carries no catalogue ids at all — no
+   * `cl_purchase_articles_id` (purchase article), `cl_vat_articles_id` /
+   * `vat_accounts_id` (VAT article/account) — this fork's catalogues have no
+   * CRM equivalent, so those stay unset rather than guessed.
+   * `suggestBookingInternal`'s supplier-history branch requires
+   * `matchedItem.cl_purchase_articles_id` (receipt-extraction.ts:2744), so a
+   * CRM-sourced history item never matches it and the call falls through to
+   * its keyword suggestion instead — a real consequence of the data model
+   * change, not a bug introduced here. `purchase_accounts_id` is filled only
+   * when the line's `accountCode` is itself a digit-only chart code (the same
+   * fast path `IdMap`'s allocation floor documents, id-map.ts): resolving an
+   * allocated CRM account id back to a numeric one needs a network round
+   * trip `fromDocument` cannot make (it is called synchronously, per row).
+   * `reversed_vat_id` is an id-typed field this fork only ever tests for
+   * presence (`!= null`, purchase-invoices.api.ts, receipt-extraction.ts); the
+   * real signal is `VAT_MAP`'s own `reversed` flag, so a reverse-charge line
+   * gets a documented sentinel (`-1`) rather than a fabricated catalogue id. */
+  private itemFromLine(l: CrmDocumentLine): PurchaseInvoiceItem {
+    const vatRow = l.vatCode ? VAT_MAP.find((r) => r.code === l.vatCode) : undefined;
+    const accountId = /^\d+$/.test(l.accountCode) && !l.accountCode.startsWith("0")
+      ? Number(l.accountCode)
+      : undefined;
+    return {
+      custom_title: l.description,
+      amount: l.quantity != null ? Number(l.quantity) : 1,
+      unit_net_price: l.unitPrice != null ? Number(l.unitPrice) : undefined,
+      total_net_price: Number(l.net),
+      vat_amount: Number(l.vatAmount),
+      vat_rate: rateFromVatCode(l.vatCode),
+      vat_rate_dropdown: vatRow?.rate,
+      purchase_accounts_id: accountId,
+      crm_vat_code: l.vatCode,
+      reversed_vat_id: vatRow?.reversed ? -1 : null,
+    };
+  }
+
+  /** Shared by `create`/`update`: every item's VAT mapped to a core v2 code
+   * via `vatCodeFor` before any write (spec R4a Task 25) — the first refusal
+   * throws before the caller's data reaches the CRM at all. Reads
+   * `crm_vat_code` first (set by `itemFromLine` above on every item this
+   * class itself returns) so re-sending an unchanged item on `update` round-trips
+   * a non-derived code (e.g. `PEUG24`) instead of re-deriving and possibly
+   * refusing it. */
+  private async buildLines(
+    items: PurchaseInvoiceItem[],
+    partyCountry: string,
+    turnoverDate: string,
+  ): Promise<{ lines: CrmLine[]; netTotal: number; vatTotal: number }> {
+    const lines: CrmLine[] = [];
+    let netTotal = 0;
+    let vatTotal = 0;
+    for (let i = 0; i < items.length; i++) {
+      const item = items[i]!;
+      const rate = item.vat_rate_dropdown ?? (item.vat_rate != null ? String(item.vat_rate) : null);
+      const reversed = item.reversed_vat_id != null;
+      const mapped = vatCodeFor({
+        direction: "IN", rate, reversed, partyCountry, turnoverDate,
+        explicit: item.crm_vat_code ?? null,
+      });
+      if ("problem" in mapped) throw new HttpError(`line ${i + 1}: ${mapped.problem}`, 422, "POST", "/documents");
+
+      const net = item.total_net_price ?? roundMoney((item.unit_net_price ?? 0) * (item.amount ?? 1));
+      const vatAmount = item.vat_amount !== undefined
+        ? item.vat_amount
+        : reversed ? 0 : roundMoney(net * (parseVatRateDropdown(rate) / 100));
+      const accountCode = item.purchase_accounts_id != null
+        ? (await this.crmIdMap.toCrm("account", [item.purchase_accounts_id]))[0]!
+        : "";
+
+      netTotal = roundMoney(netTotal + net);
+      vatTotal = roundMoney(vatTotal + vatAmount);
+      lines.push({
+        description: item.custom_title ?? "",
+        quantity: item.amount != null ? String(item.amount) : null,
+        unitPrice: item.unit_net_price != null ? moneyString(item.unit_net_price) : null,
+        net: moneyString(net),
+        side: null,
+        vatCode: mapped.code,
+        vatAmount: moneyString(vatAmount),
+        accountCode,
+        dimensionId: null,
+      });
+    }
+    return { lines, netTotal, vatTotal };
+  }
+
+  /**
+   * The CRM's `PATCH /documents/:id` replaces the whole draft (writes-documents.ts:233-253,
+   * `sourceKey` immutable) — existing fields are read back first and only the
+   * caller's changes are merged in, mirroring `SaleInvoicesApi.update`
+   * (sale-invoices.api.ts) and `JournalsApi.update` (journals.api.ts:218-238).
+   *
+   * Finding: `vat_price`/`gross_price`/`base_net_price`/`base_vat_price`/
+   * `base_gross_price`/`currency_rate`/`liability_accounts_id`/`bank_ref_number`/
+   * `bank_account_no`/`cl_currencies_id` have no CRM document field — the CRM
+   * always computes a line's `vatAmount` from `net`+`vatCode`, and this class
+   * derives `vat_price`/`gross_price` from the document's own lines on every
+   * read (`fromDocument` above), never from a stored header total. An
+   * explicit override in `data` is accepted (the tool layer's
+   * `validateUpdateFields` already governs which fields a confirmed invoice
+   * may still change) but not forwarded — the same non-guess
+   * `createAndSetTotals` already documents for `vatPrice`/`grossPrice`.
+   * Finding: because totals are always derived, `previewTotalsCorrection`'s
+   * `current_*` and `proposed_*` are now always equal for a CRM-backed
+   * invoice, so `confirmWithTotals`'s `this.update(id, { vat_price,
+   * gross_price, items })` correction branch is effectively dead — `items`
+   * still round-trips through this method, `vat_price`/`gross_price` are
+   * silently dropped as above.
+   */
   override async update(id: number, data: UpdatePurchaseInvoiceRequest): Promise<ApiResponse> {
-    return super.update(id, data);
+    const crmId = (await this.crmIdMap.toCrm("document", [id]))[0]!;
+    const existing = await this.client.get<CrmDocument>(`/documents/${crmId}`);
+    const counterpartyCrmId = data.clients_id !== undefined
+      ? (await this.crmIdMap.toCrm("counterparty", [data.clients_id]))[0]!
+      : existing.counterpartyId;
+    let lines = existing.lines as CrmLine[];
+    if (data.items) {
+      const counterparty = counterpartyCrmId
+        ? await this.client.get<CrmCounterparty>(`/counterparties/${counterpartyCrmId}`)
+        : null;
+      const turnoverDate = data.journal_date ?? existing.turnoverDate;
+      ({ lines } = await this.buildLines(data.items, counterparty?.country ?? "EE", turnoverDate));
+    }
+    const body = {
+      kind: existing.kind,
+      sourceKey: existing.sourceKey!,
+      number: data.number ?? existing.number,
+      counterpartyId: counterpartyCrmId,
+      docDate: data.create_date ?? existing.docDate,
+      turnoverDate: data.journal_date ?? existing.turnoverDate,
+      dueDate: data.term_days !== undefined
+        ? addDaysUtc(data.create_date ?? existing.docDate, data.term_days)
+        : existing.dueDate,
+      description: data.notes ?? existing.description,
+      creditsDocumentId: existing.creditsDocumentId,
+      lines,
+    };
+    await this.mutate(
+      "update", id, `${this.basePath}:${id}`, [this.basePath],
+      () => this.client.patch(`/documents/${crmId}`, body),
+    );
+    return { code: 200, messages: [] };
   }
 
   /**
@@ -215,45 +413,7 @@ export class PurchaseInvoicesApi extends BaseResource<PurchaseInvoice> {
     const counterparty = await this.client.get<CrmCounterparty>(`/counterparties/${counterpartyCrmId}`);
     const turnoverDate = data.journal_date;
 
-    type CrmLine = {
-      description: string; quantity: string | null; unitPrice: string | null; net: string;
-      side: null; vatCode: string; vatAmount: string; accountCode: string; dimensionId: string | null;
-    };
-    const lines: CrmLine[] = [];
-    let netTotal = 0;
-    let vatTotal = 0;
-    for (let i = 0; i < data.items.length; i++) {
-      const item = data.items[i]!;
-      const rate = item.vat_rate_dropdown ?? (item.vat_rate != null ? String(item.vat_rate) : null);
-      const reversed = item.reversed_vat_id != null;
-      const mapped = vatCodeFor({
-        direction: "IN", rate, reversed, partyCountry: counterparty.country, turnoverDate,
-        explicit: item.crm_vat_code ?? null,
-      });
-      if ("problem" in mapped) throw new HttpError(`line ${i + 1}: ${mapped.problem}`, 422, "POST", "/documents");
-
-      const net = item.total_net_price ?? roundMoney((item.unit_net_price ?? 0) * (item.amount ?? 1));
-      const vatAmount = item.vat_amount !== undefined
-        ? item.vat_amount
-        : reversed ? 0 : roundMoney(net * (parseVatRateDropdown(rate) / 100));
-      const accountCode = item.purchase_accounts_id != null
-        ? (await this.crmIdMap.toCrm("account", [item.purchase_accounts_id]))[0]!
-        : "";
-
-      netTotal = roundMoney(netTotal + net);
-      vatTotal = roundMoney(vatTotal + vatAmount);
-      lines.push({
-        description: item.custom_title ?? "",
-        quantity: item.amount != null ? String(item.amount) : null,
-        unitPrice: item.unit_net_price != null ? moneyString(item.unit_net_price) : null,
-        net: moneyString(net),
-        side: null,
-        vatCode: mapped.code,
-        vatAmount: moneyString(vatAmount),
-        accountCode,
-        dimensionId: null,
-      });
-    }
+    const { lines, netTotal, vatTotal } = await this.buildLines(data.items, counterparty.country, turnoverDate);
 
     const body = {
       kind: "PURCHASE_INVOICE" as const,
@@ -436,36 +596,12 @@ export class PurchaseInvoicesApi extends BaseResource<PurchaseInvoice> {
     return { code: 200, created_object_id: entryId, messages: [] };
   }
 
-  // getDocument / deleteDocument stay inherited from BaseResource, unchanged
-  // (/purchase_invoices/:id/document_user) — document-methods.test.ts pins them.
-
-  /**
-   * `POST /documents/:id/file` needs a `{ path, sha256 }` of a file the CRM already
-   * has on disk under CRM_MCP_ATTACHMENTS (crm/src/lib/crm-mcp/writes-documents.ts:255-283).
-   * `PurchaseInvoicesApi` does not opt into `BaseResource`'s document-backed mode (see the
-   * class-level finding above), so it resolves that `path` itself here rather than through
-   * the shared `this.documents` branch: `resolveCrmExtractionPath` hashes the caller's
-   * base64 `contents` and looks up the CRM's extraction record by that sha256 (spec R4a
-   * Task 30). A miss — no record yet, or a record with no re-verified path — refuses rather
-   * than inventing a path; every booking flow that uploads right after create
-   * (pdf-workflow.ts:1031, receipt-inbox-booking.ts:293, documents/operations.ts:575) then
-   * rolls back (invalidates) the invoice it just created, same as any other upload failure.
-   */
-  override async uploadDocument(id: number, _name: string, contents: string): Promise<ApiResponse> {
-    const { sha256, path } = await resolveCrmExtractionPath(this.client, contents);
-    if (!path) {
-      throw new HttpError(
-        `purchase_invoices/${id}: no CRM extraction record for this document's bytes (sha256 ${sha256}) yet — the engine's OCR step runs first, no fallback`,
-        404, "PUT", `/purchase_invoices/${id}/document_user`,
-      );
-    }
-    const crmId = (await this.crmIdMap.toCrm("document", [id]))[0]!;
-    return this.mutate(
-      "upload", id, `${this.basePath}:${id}:document_user`, [this.basePath],
-      async () => {
-        await this.client.post(`/documents/${crmId}/file`, { path, sha256 });
-        return { code: 200, messages: [] };
-      },
-    );
-  }
+  // getDocument / deleteDocument / uploadDocument now all come from
+  // `BaseResource`'s document-backed branch (`this.documents` set in the
+  // constructor above), the same as `SaleInvoicesApi`: getDocument/deleteDocument
+  // refuse honestly (the CRM's only file route, `POST /documents/:id/file`,
+  // has no matching GET/DELETE — base-resource.ts), and uploadDocument resolves
+  // the `path` it needs from the CRM's own extraction record (`GET
+  // /extractions/:sha256`, spec R4a Task 30) before `POST /documents/:id/file`.
+  // document-methods.test.ts pins all three.
 }

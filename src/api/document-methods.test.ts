@@ -26,13 +26,13 @@ function makeClient(): HttpClient {
 // specifically guards the removal of the old PurchaseInvoicesApi overrides.
 //
 // R4a Task 25 narrows this: the CRM's only file route is `POST /documents/:id/file`,
-// needing a `path` (purchase-invoices.api.ts, base-resource.ts). PurchaseInvoicesApi
-// overrides only `uploadDocument` — `getDocument`/`deleteDocument` are untouched (it
-// does not opt into BaseResource's document-backed mode; `previewTotalsCorrection`
-// needs `get`/`update` to stay on `/purchase_invoices`, so document_user stays there
-// too). SaleInvoicesApi *does* opt in (all its CRUD is CRM-native), so its
-// `getDocument`/`deleteDocument` still refuse (there is no CRM route for either).
-// JournalsApi and TransactionsApi are untouched and keep the full old-route row.
+// needing a `path` (purchase-invoices.api.ts, base-resource.ts). E2E-FIX B1 opts
+// PurchaseInvoicesApi into BaseResource's document-backed mode too (its `get`/`update`
+// now read/write `/documents/:id`, same as SaleInvoicesApi; `previewTotalsCorrection`
+// stays adapter-internal, reading through the opted-in `get`), so `getDocument`/
+// `deleteDocument` now refuse the same way SaleInvoicesApi's do (there is no CRM route
+// for either). JournalsApi and TransactionsApi are untouched and keep the full
+// old-route row.
 //
 // R4a Task 30 closes `uploadDocument` for the two CRM-backed classes: it now
 // resolves `path` from the CRM's own extraction record (`GET /extractions/:sha256`,
@@ -42,7 +42,7 @@ const OLD_ROUTE = "old" as const;
 const REFUSES = "refuses" as const;
 const CRM_EXTRACTION = "crm-extraction" as const;
 const CLASSES = [
-  ["PurchaseInvoicesApi", (c: HttpClient) => new PurchaseInvoicesApi(c), "/purchase_invoices", { get: OLD_ROUTE, upload: CRM_EXTRACTION, del: OLD_ROUTE }],
+  ["PurchaseInvoicesApi", (c: HttpClient) => new PurchaseInvoicesApi(c), "/purchase_invoices", { get: REFUSES, upload: CRM_EXTRACTION, del: REFUSES }],
   ["SaleInvoicesApi", (c: HttpClient) => new SaleInvoicesApi(c), "/sale_invoices", { get: REFUSES, upload: CRM_EXTRACTION, del: REFUSES }],
   ["JournalsApi", (c: HttpClient) => new JournalsApi(c), "/journals", { get: OLD_ROUTE, upload: OLD_ROUTE, del: OLD_ROUTE }],
   ["TransactionsApi", (c: HttpClient) => new TransactionsApi(c), "/transactions", { get: OLD_ROUTE, upload: OLD_ROUTE, del: OLD_ROUTE }],

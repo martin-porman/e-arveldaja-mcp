@@ -46,8 +46,9 @@ export type CrmDocument = {
 /** Opt-in for a `BaseResource<T>` whose records are CRM `Document` rows of one or more
  * `kind`s (spec R4a Task 25). Unset, every method below is the original RIK-shaped
  * `${basePath}` behaviour — this is a per-resource routing parameter, not a backend
- * toggle: `PurchaseInvoicesApi` deliberately does not opt in (its `get`/`update` stay
- * on `/purchase_invoices` for `previewTotalsCorrection`, which stays adapter-internal). */
+ * toggle. `PurchaseInvoicesApi` opts in too (E2E-FIX B1): `previewTotalsCorrection`
+ * stays adapter-internal, reading through the opted-in `get`/`getFreshInvoice` like
+ * every other caller. */
 export interface DocumentBackedOptions {
   readonly kinds: readonly string[];
 }
