@@ -117,6 +117,7 @@ If the user does not explicitly approve, stop.
 Call `classify_bank_transactions` again:
 - mode: "execute_apply"
 - `classifications_json`: the approved full or filtered JSON object
+- `plan_handle`: the exact `result.plan_handle` returned by the `mode: "dry_run_apply"` preview — REQUIRED for `mode: "execute_apply"`; the call is rejected without it.
 
 Report:
 - `result.execution.summary.applied`

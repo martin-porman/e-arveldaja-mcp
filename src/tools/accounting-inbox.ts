@@ -1301,23 +1301,52 @@ function findConfirmedPossibleDuplicateMatches(item: Record<string, unknown>): R
     .filter(candidate => stringAt(candidate, "status") === "CONFIRMED");
 }
 
-function extractRuleBookingFields(reviewItem: Record<string, unknown>): Record<string, unknown> | undefined {
-  const item = recordAt(reviewItem, "item");
-  const group = recordAt(reviewItem, "group");
-  const suggestion = recordAt(group ?? item ?? {}, "suggested_booking");
-  if (!suggestion) return undefined;
+// `match` and `category` are intentionally absent from this whitelist — they are
+// derived from the counterparty label and group category at the call site, not
+// from the suggested-booking payload.
+const RULE_BOOKING_NUMBER_FIELDS = ["purchase_article_id", "purchase_account_id", "purchase_account_dimensions_id", "liability_account_id", "reversed_vat_id"] as const;
+const RULE_BOOKING_STRING_FIELDS = ["vat_rate_dropdown", "reason"] as const;
+
+// F4 (2026-09-26 flow report §15): the receipt batch emits `booking_suggestion`
+// = `{ item: PurchaseInvoiceItem, source, suggested_liability_account_id? }`
+// (receipt-extraction.ts BookingSuggestion; batch-operations.ts buildNeedsReviewResult),
+// not the flat shape below — the booking fields live under `item` and use the
+// PurchaseInvoiceItem field names, and the liability account is a sibling of `item`.
+function extractFromBookingSuggestion(suggestion: Record<string, unknown>): Record<string, unknown> | undefined {
+  const source = stringAt(suggestion, "source");
+  if (source !== "supplier_history" && source !== "local_rules") return undefined;
+  const item = recordAt(suggestion, "item");
+  if (!item) return undefined;
+
+  const fields: Record<string, unknown> = {};
+  const articleId = numberAt(item, "cl_purchase_articles_id");
+  if (articleId !== undefined) fields.purchase_article_id = articleId;
+  const accountId = numberAt(item, "purchase_accounts_id");
+  if (accountId !== undefined) fields.purchase_account_id = accountId;
+  const dimensionsId = numberAt(item, "purchase_accounts_dimensions_id");
+  if (dimensionsId !== undefined) fields.purchase_account_dimensions_id = dimensionsId;
+  const liabilityAccountId = numberAt(suggestion, "suggested_liability_account_id");
+  if (liabilityAccountId !== undefined) fields.liability_account_id = liabilityAccountId;
+  const reversedVatId = numberAt(item, "reversed_vat_id");
+  if (reversedVatId !== undefined) fields.reversed_vat_id = reversedVatId;
+  const vatRateDropdown = stringAt(item, "vat_rate_dropdown");
+  if (vatRateDropdown !== undefined) fields.vat_rate_dropdown = vatRateDropdown;
+
+  return Object.keys(fields).length > 0 ? fields : undefined;
+}
+
+// Older flat shape (still emitted by classify-unmatched's local-rules/keyword
+// suggestions): the same field names live directly on `suggested_booking`.
+function extractFromFlatSuggestion(suggestion: Record<string, unknown>): Record<string, unknown> | undefined {
   const source = stringAt(suggestion, "source");
   if (source !== "supplier_history" && source !== "local_rules") {
     return undefined;
   }
 
   const fields: Record<string, unknown> = {};
-  // `match` and `category` are intentionally absent from this whitelist — they are
-  // derived from the counterparty label and group category at the call site, not
-  // from the suggested_booking payload.
 
   // Number fields — silently drop if the value is present but not a finite number.
-  for (const key of ["purchase_article_id", "purchase_account_id", "purchase_account_dimensions_id", "liability_account_id", "reversed_vat_id"] as const) {
+  for (const key of RULE_BOOKING_NUMBER_FIELDS) {
     const value = suggestion[key];
     if (value === undefined) continue;
     if (typeof value === "number" && Number.isFinite(value)) fields[key] = value;
@@ -1325,7 +1354,7 @@ function extractRuleBookingFields(reviewItem: Record<string, unknown>): Record<s
   }
 
   // String fields — silently drop if the value is present but not a string.
-  for (const key of ["vat_rate_dropdown", "reason"] as const) {
+  for (const key of RULE_BOOKING_STRING_FIELDS) {
     const value = suggestion[key];
     if (value === undefined) continue;
     if (typeof value === "string") fields[key] = value;
@@ -1333,6 +1362,38 @@ function extractRuleBookingFields(reviewItem: Record<string, unknown>): Record<s
   }
 
   return Object.keys(fields).length > 0 ? fields : undefined;
+}
+
+export function extractRuleBookingFields(reviewItem: Record<string, unknown>): Record<string, unknown> | undefined {
+  const item = recordAt(reviewItem, "item");
+  const group = recordAt(reviewItem, "group");
+  const container = group ?? item ?? {};
+  const bookingSuggestion = recordAt(container, "booking_suggestion");
+  if (bookingSuggestion) return extractFromBookingSuggestion(bookingSuggestion);
+  const suggestion = recordAt(container, "suggested_booking");
+  if (!suggestion) return undefined;
+  return extractFromFlatSuggestion(suggestion);
+}
+
+// F4 continued: the rule's match key. Prefer the resolved/normalized
+// `display_counterparty` (item over group, matching the pre-existing lookup
+// order); when absent, fall back to the receipt batch's resolved supplier
+// (`supplier_resolution.client.name`), which is present on `booking_suggestion`
+// review items but carries no `display_counterparty` of its own.
+function supplierResolutionClientName(record: Record<string, unknown> | undefined): string | undefined {
+  if (!record) return undefined;
+  const supplierResolution = recordAt(record, "supplier_resolution");
+  const client = supplierResolution ? recordAt(supplierResolution, "client") : undefined;
+  return client ? stringAt(client, "name") : undefined;
+}
+
+export function ruleMatchLabel(reviewItem: Record<string, unknown>): string | undefined {
+  const item = recordAt(reviewItem, "item");
+  const group = recordAt(reviewItem, "group");
+  return stringAt(item ?? {}, "display_counterparty") ??
+    stringAt(group ?? {}, "display_counterparty") ??
+    supplierResolutionClientName(item) ??
+    supplierResolutionClientName(group);
 }
 
 function mergeRuleOverrides(
@@ -1554,9 +1615,7 @@ function prepareReviewAction(
     // round-tripped from a wrapped classify/review response, so strip markers
     // before it becomes the proposed rule KEY (saveAutoBookingRule canonicalizes
     // again at persist, but the proposed/echoed key must also be marker-free).
-    const rawMatch = stringAt(mergedRuleOverride ?? {}, "match") ??
-      stringAt(item ?? {}, "display_counterparty") ??
-      stringAt(group ?? {}, "display_counterparty");
+    const rawMatch = stringAt(mergedRuleOverride ?? {}, "match") ?? ruleMatchLabel(reviewItem);
     const match = rawMatch !== undefined ? canonicalBusinessText(rawMatch) || undefined : undefined;
     const category = stringAt(mergedRuleOverride ?? {}, "category") ??
       stringAt(group ?? {}, "category");
@@ -2201,6 +2260,63 @@ async function buildOwnerExpenseExecuteResponse(
   return bookOwnerExpenseFromProjection(api, freshProjection.projection, { rewrapDescription: sandboxExternalText });
 }
 
+// F3 (2026-09-26 flow report §15): a compact guided continuation answers one
+// workflow row by item_id; the row's `code` becomes the judgment's `question`
+// (workflowStateDetailItems / blockerFrom already treat `code` as the stable
+// question identifier for a needs_review/needs_decision row).
+function findAnsweredWorkflowRowCode(workflow: Record<string, unknown>, itemId: string): string | undefined {
+  const rows = [...arrayAt(workflow, "needs_review"), ...arrayAt(workflow, "needs_decision")];
+  for (const row of rows) {
+    if (!isRecord(row)) continue;
+    if (stringAt(row, "item_id") === itemId || stringAt(row, "id") === itemId) {
+      return stringAt(row, "code");
+    }
+  }
+  return undefined;
+}
+
+// Drop the now-resolved row(s) so the next continuation stops re-asking the
+// question the operator just answered.
+function removeAnsweredWorkflowRow(workflow: Record<string, unknown>, itemId: string): Record<string, unknown> {
+  const matchesItem = (row: unknown): boolean =>
+    isRecord(row) && (stringAt(row, "item_id") === itemId || stringAt(row, "id") === itemId);
+  const result: Record<string, unknown> = { ...workflow };
+  for (const key of ["needs_review", "needs_decision"] as const) {
+    const rows = arrayAt(workflow, key);
+    if (rows.length > 0) result[key] = rows.filter(row => !matchesItem(row));
+  }
+  return result;
+}
+
+/** Build the `POST /judgments` body for one operator answer to a workflow item. */
+export function judgmentForAnswer(params: {
+  workflowHandle: string;
+  itemId: string;
+  questionKey: string;
+  answer: string;
+}): { scope: string; question: string; answer: string; rationale: string; source: string } {
+  return {
+    scope: `workflow:${params.workflowHandle}:${params.itemId}`,
+    question: params.questionKey,
+    answer: params.answer,
+    rationale: "operator answer via continue_accounting_workflow",
+    source: "answer",
+  };
+}
+
+function answerRequiresWorkflowItemResponse(): CallToolResult {
+  return {
+    content: [{
+      type: "text",
+      text: toMcpJson({
+        status: "error",
+        error_code: "answer_requires_workflow_item",
+        error: "action='next' with an answer needs workflow_handle and item_id to know which workflow row it answers.",
+      }),
+    }],
+  };
+}
+
 export function registerAccountingInboxTools(
   server: McpServer,
   api: ApiContext,
@@ -2245,7 +2361,7 @@ export function registerAccountingInboxTools(
     // real, plan-gated owner-expense booking. next/resolve_review/prepare_action stay
     // behaviorally read-only for every other review type.
     { ...mutate, title: "Continue Accounting Workflow" },
-    async ({ action, workflow_state_json, review_item_json, save_as_rule, rule_override_json, plan_handle }) => {
+    async ({ action, workflow_handle, item_id, answer, workflow_state_json, review_item_json, save_as_rule, rule_override_json, plan_handle }) => {
       if (action === "resolve_review") {
         const reviewItem = parseRequiredJsonObject(review_item_json, "review_item_json");
         return buildReviewResolutionResponse(reviewItem, exposure);
@@ -2277,12 +2393,43 @@ export function registerAccountingInboxTools(
         }, exposure);
       }
 
+      // F3 (2026-09-26 flow report §15): an answer is meaningless without knowing
+      // WHICH workflow item it resolves. Checked before parsing workflow_state_json
+      // so a bare {action:"next", answer} fails with this message, not a generic
+      // "workflow_state_json is required".
+      if (answer !== undefined && (workflow_handle === undefined || item_id === undefined)) {
+        return answerRequiresWorkflowItemResponse();
+      }
+
       const workflowState = parseRequiredJsonObject(workflow_state_json, "workflow_state_json");
-      const v1Workflow = remapHiddenGranularWorkflowEnvelope(
+      let v1Workflow: unknown = remapHiddenGranularWorkflowEnvelope(
         isRecord(workflowState.workflow)
           ? workflowState.workflow
           : workflowFromAccountingInboxPayload(workflowState),
       );
+
+      if (answer !== undefined) {
+        const answeredHandle = workflow_handle as string;
+        const answeredItemId = item_id as string;
+        const questionKey = (isRecord(v1Workflow) ? findAnsweredWorkflowRowCode(v1Workflow, answeredItemId) : undefined) ?? answeredItemId;
+        await api.crm?.recordJudgment(judgmentForAnswer({
+          workflowHandle: answeredHandle,
+          itemId: answeredItemId,
+          questionKey,
+          answer,
+        }));
+        if (isRecord(v1Workflow)) {
+          // The answered row is now resolved: drop it so the continuation stops
+          // re-asking it, and record the (untrusted) answer text for downstream
+          // resolution — sandboxed here because `answers` re-enters the model-facing
+          // envelope below, unlike the judgment body above, which is never echoed.
+          v1Workflow = {
+            ...removeAnsweredWorkflowRow(v1Workflow, answeredItemId),
+            answers: { ...(recordAt(v1Workflow, "answers") ?? {}), [answeredItemId]: sandboxExternalText(answer) },
+          };
+        }
+      }
+
       // Derive the human label from the v1 envelope's recommended action so the
       // message is identical across profiles; the emitted envelope may then be
       // projected to the compact v2 form for guided/guided-sales.

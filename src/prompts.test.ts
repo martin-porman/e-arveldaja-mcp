@@ -443,7 +443,7 @@ describe("registerPrompts", () => {
     expect(text).toContain("process_accounting_document");
     expect(text).toContain('mode: "prepare"');
     expect(text).toContain('mode: "create"');
-    expect(text).toContain("summary.plan_handle");
+    expect(text).toContain("plan_handle");
     // Two-call ordering: prepare/approve BEFORE create; create BEFORE confirm.
     const prepare = text.indexOf('mode: "prepare"');
     const approvalStop = text.indexOf("If the user has not explicitly approved the preview, stop here and wait.");
@@ -463,7 +463,7 @@ describe("registerPrompts", () => {
       expect(text).toContain("process_accounting_document");
       expect(text).toContain('mode: "prepare"');
       expect(text).toContain('mode: "create"');
-      expect(text).toContain("summary.plan_handle");
+      expect(text).toContain("plan_handle");
       // Every staged-safety statement must survive the façade migration.
       expect(text).toContain("untrusted OCR output");
       expect(text).toContain("is not approval");

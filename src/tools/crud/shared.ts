@@ -17,6 +17,15 @@ import type {
   TransactionDistribution,
 } from "../../types/api.js";
 
+/** Body of `POST /judgments` (CRM fork-stores route, scope prepare; Task 21/27). */
+export interface JudgmentRecordInput {
+  scope: string;
+  question: string;
+  answer: string;
+  rationale: string;
+  source: string;
+}
+
 export interface ApiContext {
   clients: ClientsApi;
   products: ProductsApi;
@@ -25,6 +34,14 @@ export interface ApiContext {
   saleInvoices: SaleInvoicesApi;
   purchaseInvoices: PurchaseInvoicesApi;
   readonly: ReferenceDataApi;
+  /**
+   * CRM-fork only (Task 27): records one operator judgment against a
+   * workflow-item scope via the CRM's `POST /judgments`. Absent outside the
+   * single "crm" fork connection — every call site must optional-chain it.
+   */
+  crm?: {
+    recordJudgment(body: JudgmentRecordInput): Promise<{ id: string }>;
+  };
 }
 
 /** Check if company is VAT-registered via /vat_info */

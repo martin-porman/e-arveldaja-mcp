@@ -338,6 +338,12 @@ export async function createMcpServer(
       persistenceSink.load("operation_results"),
       fetchIdentity(persistenceClient),
     ]);
+    // Task 27: the fork's only judgments write path. Reuses the same
+    // persistence client (same base URL/credentials as fork/state/*) since
+    // `judgments` is a sibling top-level CRM route, not nested under `fork/`.
+    api.crm = {
+      recordJudgment: (body) => persistenceClient.post<{ id: string }>("/judgments", body),
+    };
   }
 
   const runtimeSafetyContext = createRuntimeSafetyContext({
