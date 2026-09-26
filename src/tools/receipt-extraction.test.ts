@@ -2115,6 +2115,38 @@ describe("extractReceiptFieldsFromCrmFields — the Kesko live-record example (E
     const extracted = extractReceiptFieldsFromCrmFields(tier1, "receipt.jpg");
     expect(extracted.min_ocr_confidence).toBeUndefined();
   });
+
+  // E2E-FIX B3: every CRM-fields record is tagged so classifyReceiptDocument
+  // and processSingleReceipt (batch-operations.ts) can key off it instead of
+  // inferring the source from raw_text emptiness.
+  it("tags every record as via_crm_fields regardless of tier/confidence", () => {
+    expect(extractReceiptFieldsFromCrmFields(keskoFields, "receipt.jpg").via_crm_fields).toBe(true);
+    const tier1: CrmParsedFields = { ...keskoFields, tier: "1", confidence: "high" };
+    expect(extractReceiptFieldsFromCrmFields(tier1, "receipt.jpg").via_crm_fields).toBe(true);
+  });
+
+  // E2E-FIX B3: a "low" CRM confidence (not accepted, or a failed check) maps
+  // to a materially lower value than a clean "medium" tier-2 read, even
+  // though both currently trip the same shared low_ocr_confidence signal —
+  // and it also carries `ocr_read_confidence: "low"` so processSingleReceipt
+  // can add the LOW-tier ocr_read_rejected signal (the numeric threshold
+  // alone cannot force overall confidence to "low").
+  it("maps a low CRM confidence to a lower min_ocr_confidence than medium, and tags ocr_read_confidence", () => {
+    const low: CrmParsedFields = { ...keskoFields, confidence: "low" };
+    const extracted = extractReceiptFieldsFromCrmFields(low, "receipt.jpg");
+    expect(extracted.min_ocr_confidence).toBeLessThan(0.6);
+    expect(extracted.ocr_read_confidence).toBe("low");
+    const medium = extractReceiptFieldsFromCrmFields(keskoFields, "receipt.jpg");
+    expect(medium.ocr_read_confidence).toBe("medium");
+    expect(extracted.min_ocr_confidence!).toBeLessThan(medium.min_ocr_confidence!);
+  });
+
+  it("tags ocr_read_confidence: 'high' but sets no min_ocr_confidence for a high-confidence tier 1 read", () => {
+    const tier1: CrmParsedFields = { ...keskoFields, tier: "1", confidence: "high" };
+    const extracted = extractReceiptFieldsFromCrmFields(tier1, "receipt.jpg");
+    expect(extracted.ocr_read_confidence).toBe("high");
+    expect(extracted.min_ocr_confidence).toBeUndefined();
+  });
 });
 
 describe("shouldUseCrmFields — dispatch predicate (E2E-FIX B2)", () => {

@@ -359,12 +359,25 @@ async function processSingleReceipt(
 
   try {
     const extracted = await extractReceiptFields(snapshot, options.ownCompanyVat, options.ownCompanyRegistryCode);
-    const classification = classifyReceiptDocument(extracted.raw_text ?? file.name, file.name);
+    const classification = classifyReceiptDocument(extracted.raw_text ?? file.name, file.name, extracted);
     const selfVatDetected = detectSelfVatOnly(extracted, options.ownCompanyVat);
     const signals: ExtractionConfidenceSignals = {};
     if (extracted.partial_ocr_failure) signals.partial_ocr_failure = true;
     if (extracted.min_ocr_confidence !== undefined && extracted.min_ocr_confidence < LOW_OCR_CONFIDENCE_THRESHOLD) {
       signals.low_ocr_confidence = true;
+    }
+    // CRM-fields-sourced records have no raw-text transcript by design (the
+    // CRM's own OCR already read the document — see min_ocr_confidence /
+    // low_ocr_confidence above); don't let summarizeInvoiceExtraction treat
+    // that absence as a low-confidence "nothing has read this" signal
+    // (E2E-FIX B3).
+    if (extracted.via_crm_fields) signals.raw_text_not_applicable = true;
+    // The CRM's own OCR did not accept this read (ocrConfidence() -> "low")
+    // — a LOW signal, distinct from low_ocr_confidence's medium-tier soft
+    // dip, because the CRM itself rejected or flagged the read, not just a
+    // per-item confidence number (E2E-FIX B3).
+    if (extracted.via_crm_fields && extracted.ocr_read_confidence === "low") {
+      signals.ocr_read_rejected = true;
     }
     if (selfVatDetected) signals.self_vat_detected = true;
     const selfRegCodeDetected = detectSelfRegCodeOnly(extracted, options.ownCompanyRegistryCode);
@@ -387,7 +400,10 @@ async function processSingleReceipt(
     const summarize = () => summarizeInvoiceExtraction(extracted, signals, "extracted.raw_text", inferredSupplierCountry);
     const llmFallback = summarize();
 
-    if (file.file_type !== "pdf") {
+    // CRM_API_URL mode never runs LiteParse (document-parser.ts) — an image
+    // read via the CRM's own OCR fields did not go through it, so the note
+    // would misstate how the document was read (E2E-FIX B3).
+    if (file.file_type !== "pdf" && !extracted.via_crm_fields) {
       notes.push("Image receipt OCR-parsed with LiteParse.");
     }
     if (selfVatDetected) {

@@ -1086,6 +1086,54 @@ describe("classifyReceiptDocument", () => {
     expect(classifyReceiptDocument(text, "Kviitung-2036-1466-3430.pdf")).toBe("payment_receipt");
     expect(classifyReceiptDocument(text, "Quittung-2036-1466-3430.pdf")).toBe("payment_receipt");
   });
+
+  // E2E-FIX B3: CRM structured fields (extractReceiptFieldsFromCrmFields) with
+  // no keyword-matching raw text — the live Kesko receipt case. The document's
+  // own identity/number/total, not a text keyword, drives the classification.
+  describe("with CRM fields (E2E-FIX B3)", () => {
+    const keskoExtracted = {
+      supplier_name: "AS Kesko Senukai Estonia",
+      supplier_reg_code: "10026621",
+      supplier_vat_no: "EE100269136",
+      invoice_number: "E309 20260103 04 084460",
+      total_gross: 18.60,
+      via_crm_fields: true,
+    };
+
+    it("classifies a CRM-fields supplier purchase document as purchase_invoice with no raw text", () => {
+      expect(
+        classifyReceiptDocument("WhatsApp Image 2026-01-03 at 12.34.56.jpg", "WhatsApp Image 2026-01-03 at 12.34.56.jpg", keskoExtracted),
+      ).toBe("purchase_invoice");
+    });
+
+    it("stays unclassifiable when the CRM fields carry no reg code or VAT number", () => {
+      const { supplier_reg_code, supplier_vat_no, ...withoutIdentity } = keskoExtracted;
+      expect(
+        classifyReceiptDocument("WhatsApp Image ....jpg", "WhatsApp Image ....jpg", withoutIdentity),
+      ).toBe("unclassifiable");
+    });
+
+    it("stays unclassifiable when the CRM fields carry no document number", () => {
+      const { invoice_number, ...withoutNumber } = keskoExtracted;
+      expect(
+        classifyReceiptDocument("WhatsApp Image ....jpg", "WhatsApp Image ....jpg", withoutNumber),
+      ).toBe("unclassifiable");
+    });
+
+    it("stays unclassifiable when the CRM fields carry no gross total", () => {
+      const { total_gross, ...withoutTotal } = keskoExtracted;
+      expect(
+        classifyReceiptDocument("WhatsApp Image ....jpg", "WhatsApp Image ....jpg", withoutTotal),
+      ).toBe("unclassifiable");
+    });
+
+    it("does not apply the structured-fields rule when via_crm_fields is not set (text-parsed path unchanged)", () => {
+      const { via_crm_fields, ...textParsed } = keskoExtracted;
+      expect(
+        classifyReceiptDocument("WhatsApp Image ....jpg", "WhatsApp Image ....jpg", textParsed),
+      ).toBe("unclassifiable");
+    });
+  });
 });
 
 describe("detectSelfVatOnly", () => {

@@ -255,6 +255,25 @@ export interface ExtractedReceiptFields {
   rejected_candidates?: RejectedCandidate[];
   field_provenance?: FieldProvenance[];
   extraction_notes?: string[];
+  /**
+   * Set when these fields were read directly from the CRM's own structured
+   * OCR (extractReceiptFieldsFromCrmFields), not parsed from a raw-text
+   * transcript. classifyReceiptDocument uses it to classify off the
+   * structured fields when there is nothing usable in `raw_text`, and
+   * processSingleReceipt uses it to suppress text-parsing-only assumptions
+   * (the LiteParse note, the raw_text_missing low-confidence signal) that do
+   * not apply to a CRM-sourced read (E2E-FIX B3).
+   */
+  via_crm_fields?: boolean;
+  /**
+   * The CRM's own composed OCR confidence for this read (`ocrConfidence()`,
+   * onboarding-tools.ts:198) — "high" | "medium" | "low", carried through
+   * verbatim so processSingleReceipt can tell a genuinely rejected/failed-
+   * check read ("low") from a clean-but-not-tier-1 read ("medium") and set
+   * the right ExtractionConfidenceSignals low/medium signal, instead of
+   * inferring it back out of a numeric min_ocr_confidence value (E2E-FIX B3).
+   */
+  ocr_read_confidence?: "high" | "medium" | "low";
 }
 
 export interface TransactionGroupClassificationInput {
@@ -2505,7 +2524,39 @@ export function categorizeTransactionGroup(input: TransactionGroupClassification
   };
 }
 
-export function classifyReceiptDocument(text: string, fileName: string): ReceiptClassification {
+/**
+ * True when CRM-sourced structured fields (extractReceiptFieldsFromCrmFields,
+ * `extracted.via_crm_fields`) carry enough of the document's own identity to
+ * book it as a supplier purchase document: the supplier's own identity (name
+ * plus a registry code or VAT number — not just a name), a document number
+ * (this document's own invoice/reference number), and a gross total. This is
+ * the structured-fields analogue of the `hasInvoiceKeywords` text rule below
+ * — a document that states who it is from, what it is, and what it totals.
+ *
+ * There is no structured-fields equivalent of the `payment_receipt` text rule
+ * (payment-confirmation language plus a number referencing a *separate*
+ * already-existing invoice): CRM fields carry only this document's own
+ * identifiers, never a reference to another document. So a CRM-fields
+ * document can only ever resolve to `purchase_invoice` here, never
+ * `payment_receipt` — it stays `unclassifiable` when the identity, number, or
+ * total is missing, exactly like a text document with no keyword match
+ * (E2E-FIX B3).
+ */
+function isCrmSupplierPurchaseDocument(extracted: ExtractedReceiptFields | undefined): boolean {
+  if (!extracted?.via_crm_fields) return false;
+  const hasSupplierIdentity = Boolean(
+    extracted.supplier_name && (extracted.supplier_reg_code || extracted.supplier_vat_no),
+  );
+  const hasDocumentNumber = Boolean(extracted.invoice_number || extracted.ref_number);
+  const hasGrossTotal = extracted.total_gross !== undefined;
+  return hasSupplierIdentity && hasDocumentNumber && hasGrossTotal;
+}
+
+export function classifyReceiptDocument(
+  text: string,
+  fileName: string,
+  extracted?: ExtractedReceiptFields,
+): ReceiptClassification {
   const combined = `${text}\n${fileName}`;
   const hasSalesInvoiceKeywords = /\b(müügiarve|sale invoice)\b/i.test(combined);
   const hasInvoiceKeywords = /\b(arve|invoice|ostuarve|bill to)\b/i.test(combined);
@@ -2546,6 +2597,10 @@ export function classifyReceiptDocument(text: string, fileName: string): Receipt
 
   if (hasReceiptKeywords || hasExpenseKeywords || hasTravelTicketKeywords || hasOrderReceiptKeywords) {
     return "owner_paid_expense_reimbursement";
+  }
+
+  if (isCrmSupplierPurchaseDocument(extracted)) {
+    return "purchase_invoice";
   }
 
   return "unclassifiable";
@@ -2617,6 +2672,28 @@ export function extractReceiptFieldsFromCrmFields(
     .filter((description): description is string => description !== undefined);
   const vatAmount = crmNum(f.vatAmount);
   const confidence = crmFields.confidence;
+  // Mirrors the CRM's own composed confidence (`ocrConfidence()`,
+  // onboarding-tools.ts:198: not accepted or a failed check -> "low"; tier 1,
+  // accepted, nothing unverified -> "high"; everything else (tier 2, accepted,
+  // no failed check) -> "medium"). `crmFields.confidence` is declared as a
+  // bare `string` (it crosses a service boundary) — narrow it once here so a
+  // garbled/unexpected value falls back to undefined ("no signal") instead of
+  // silently matching neither branch below and reading as "high".
+  const ocrReadConfidence: "high" | "medium" | "low" | undefined =
+    confidence === "high" || confidence === "medium" || confidence === "low" ? confidence : undefined;
+  // "high" needs no flag at all. "medium" needs a value under the shared
+  // LOW_OCR_CONFIDENCE_THRESHOLD so processSingleReceipt's existing
+  // low_ocr_confidence signal fires the same way it would for a
+  // low-confidence text-parsed read (medium signal — the read still
+  // succeeded). "low" gets the same numeric treatment for that same reason,
+  // but processSingleReceipt also reads `ocr_read_confidence` directly to add
+  // a LOW signal (`ocr_read_rejected`) — the CRM did not accept this read at
+  // all, which the shared numeric threshold alone cannot express (E2E-FIX B3).
+  const minOcrConfidence = ocrReadConfidence === "medium"
+    ? 0.55
+    : ocrReadConfidence === "low"
+      ? 0.2
+      : undefined;
 
   return {
     supplier_name: crmStr(f.supplierName),
@@ -2639,12 +2716,12 @@ export function extractReceiptFieldsFromCrmFields(
     // Real evidence, not fabricated: used for classification and for the
     // review-guidance raw_text field, same as the text-parsed path.
     raw_text: crmStr(f.sourceText),
-    // Mirrors the CRM's own composed confidence (`ocrConfidence()`,
-    // onboarding-tools.ts:198): "high" needs no flag; tier 2 or a failed check
-    // ("medium"/"low") is mapped below the shared LOW_OCR_CONFIDENCE_THRESHOLD
-    // so processSingleReceipt's existing low_ocr_confidence signal fires the
-    // same way it would for a low-confidence text-parsed read.
-    ...(confidence !== undefined && confidence !== "high" ? { min_ocr_confidence: 0.5 } : {}),
+    ...(minOcrConfidence !== undefined ? { min_ocr_confidence: minOcrConfidence } : {}),
+    ...(ocrReadConfidence !== undefined ? { ocr_read_confidence: ocrReadConfidence } : {}),
+    // These fields came from the CRM's own OCR read, not a raw-text parse —
+    // classifyReceiptDocument, and processSingleReceipt's LiteParse note and
+    // raw_text_missing signal, all key off this (E2E-FIX B3).
+    via_crm_fields: true,
     extraction_notes: [
       `Fields read directly from the CRM's own OCR (tier ${crmFields.tier}${confidence ? `, confidence ${confidence}` : ""}); not re-parsed from text.`,
     ],

@@ -328,6 +328,45 @@ describe("summarizeInvoiceExtraction", () => {
       expect(result.confidence_signals).toContain("raw_text_missing");
     });
 
+    // E2E-FIX B3: a CRM-fields-sourced record has no raw_text transcript by
+    // design (the CRM's own OCR already read the document), not because
+    // nothing read it. raw_text_not_applicable must suppress raw_text_missing
+    // so a clean CRM-fields read is not auto-flagged low for a reason that
+    // does not apply to it.
+    it("does not force low when raw_text is missing but raw_text_not_applicable is set (CRM fields)", () => {
+      const result = summarizeInvoiceExtraction(
+        { ...baseGood, raw_text: undefined },
+        { raw_text_not_applicable: true },
+      );
+      expect(result.confidence).toBe("high");
+      expect(result.confidence_signals).not.toContain("raw_text_missing");
+      expect(result.raw_text_available).toBe(false);
+    });
+
+    it("still forces low for raw_text_not_applicable when a required field is also missing", () => {
+      const result = summarizeInvoiceExtraction(
+        { ...baseGood, raw_text: undefined, supplier_name: undefined },
+        { raw_text_not_applicable: true },
+      );
+      expect(result.confidence).toBe("low");
+      expect(result.confidence_signals).not.toContain("raw_text_missing");
+      expect(result.confidence_signals).toContain("missing_required_fields");
+    });
+
+    // E2E-FIX B3: the CRM's OWN OCR read was rejected (ocrConfidence() ->
+    // "low") — a stronger claim than the soft per-item low_ocr_confidence dip.
+    // ocr_read_rejected is a LOW signal so this forces "low" even though
+    // raw_text_not_applicable already suppressed raw_text_missing.
+    it("forces low via ocr_read_rejected even when raw_text_not_applicable suppresses raw_text_missing", () => {
+      const result = summarizeInvoiceExtraction(
+        { ...baseGood, raw_text: undefined },
+        { raw_text_not_applicable: true, ocr_read_rejected: true },
+      );
+      expect(result.confidence).toBe("low");
+      expect(result.confidence_signals).toContain("ocr_read_rejected");
+      expect(result.confidence_signals).not.toContain("raw_text_missing");
+    });
+
     it("collects multiple signals into confidence_signals", () => {
       const result = summarizeInvoiceExtraction(baseGood, {
         self_vat_detected: true,

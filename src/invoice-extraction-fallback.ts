@@ -67,6 +67,27 @@ export interface ExtractionConfidenceSignals {
    * lost), but not trusted as firmly coordinate-confirmed.
    */
   supplier_identifier_echo_unconfirmed?: boolean;
+  /**
+   * The snapshot's fields came from the CRM's own structured OCR read
+   * (extractReceiptFieldsFromCrmFields), not a raw-text transcript. The
+   * document was still read — at whatever confidence min_ocr_confidence /
+   * low_ocr_confidence already carries — so an empty `raw_text` here does not
+   * mean the read failed or is missing; it means there was no plain-text
+   * transcript to attach. Suppresses the raw_text_missing low signal below,
+   * which exists for documents nothing has actually read yet (E2E-FIX B3).
+   */
+  raw_text_not_applicable?: boolean;
+  /**
+   * The CRM's own OCR read for this record was rejected: `ocrConfidence()`
+   * (onboarding-tools.ts:198) returned "low" — the read was not accepted, or
+   * failed a validation check. Unlike `low_ocr_confidence` (a soft per-item
+   * confidence dip below LOW_OCR_CONFIDENCE_THRESHOLD — a medium signal,
+   * because the read otherwise succeeded), this is a low signal: the CRM
+   * itself did not accept the read, so it forces confidence to "low"
+   * regardless of every other signal, the same way a genuinely un-OCR'd
+   * document does (E2E-FIX B3).
+   */
+  ocr_read_rejected?: boolean;
 }
 
 export interface InvoiceExtractionFallback {
@@ -132,6 +153,12 @@ export function summarizeInvoiceExtraction(
   ].filter((value): value is string => value !== undefined);
 
   const rawTextAvailable = Boolean(snapshot.raw_text?.trim());
+  // A CRM-fields-sourced record (raw_text_not_applicable) has no raw-text
+  // transcript by design, not because nothing read the document — treat that
+  // absence as satisfied for the low-signal check and the raw-text-specific
+  // reason/guidance text below, while `raw_text_available` above keeps
+  // reporting the real, unmodified fact for callers who read it directly.
+  const rawTextOk = rawTextAvailable || signals?.raw_text_not_applicable === true;
   const currencyDefaulted = currencyRequired && !snapshot.currency;
 
   // Confidence ladder (#20): plausibility check, not just field presence.
@@ -147,7 +174,8 @@ export function summarizeInvoiceExtraction(
   const lowSignals: string[] = [];
   const mediumSignals: string[] = [];
 
-  if (!rawTextAvailable) lowSignals.push("raw_text_missing");
+  if (!rawTextOk) lowSignals.push("raw_text_missing");
+  if (signals?.ocr_read_rejected) lowSignals.push("ocr_read_rejected");
   if (missingRequiredFields.length > 0) lowSignals.push("missing_required_fields");
   if (currencyDefaulted) lowSignals.push("currency_defaulted");
   if (signals?.self_vat_detected) lowSignals.push("self_vat_detected");
@@ -192,7 +220,7 @@ export function summarizeInvoiceExtraction(
   // outcome should still surface the recommendation.
   const recommended = confidence !== "high";
 
-  const reason = !rawTextAvailable
+  const reason = !rawTextOk
     ? "No OCR/raw text is available for semantic fallback."
     : missingRequiredFields.length > 0
       ? "Deterministic extraction left required invoice fields unresolved."
@@ -200,11 +228,15 @@ export function summarizeInvoiceExtraction(
         ? "Deterministic extraction found the minimum fields needed for invoice review."
         : `Deterministic extraction completed but confidence is ${confidence} due to: ${confidenceSignals.join(", ")}.`;
 
-  const guidance = !rawTextAvailable
+  const guidance = !rawTextOk
     ? "Keep the document in review. Without raw_text, the model cannot safely recover the missing fields."
     : recommended
-      ? `Use ${rawTextField} as the source of truth. Extract the missing required fields manually with the model, then validate totals before booking. If the document still does not contain them, keep the result in review instead of guessing.`
-      : "Raw OCR text is available for verification. Use it to confirm ambiguous fields before executing any booking."
+      ? (rawTextAvailable
+          ? `Use ${rawTextField} as the source of truth. Extract the missing required fields manually with the model, then validate totals before booking. If the document still does not contain them, keep the result in review instead of guessing.`
+          : "Fields were read directly from the CRM's own OCR; there is no raw text transcript to fall back on, so verify the extracted fields against the source document before booking.")
+      : (rawTextAvailable
+          ? "Raw OCR text is available for verification. Use it to confirm ambiguous fields before executing any booking."
+          : "Fields were read directly from the CRM's own OCR with no raw text transcript. Verify against the source document if anything looks off.")
   ;
 
   return {

@@ -30,7 +30,10 @@ vi.mock("fs/promises", async (importOriginal) => {
   return {
     ...actual,
     open: vi.fn().mockImplementation(async (path: unknown) => {
-      const isFile = String(path).toLowerCase().endsWith(".pdf");
+      // A bare receipt-folder path has no extension; any receipt file does
+      // (.pdf, .jpg, .png, ...) — generalized from a .pdf-only check so
+      // non-PDF (image) receipt fixtures work the same way (E2E-FIX B3).
+      const isFile = /\.[a-zA-Z0-9]+$/.test(String(path));
       return {
         fd: 42,
         stat: vi.fn().mockResolvedValue({
@@ -167,7 +170,10 @@ interface ApiSpies {
   invalidate: ReturnType<typeof vi.fn>;
 }
 
-function makeApi(spies: Partial<ApiSpies> = {}): { api: never; spies: ApiSpies } {
+function makeApi(
+  spies: Partial<ApiSpies> = {},
+  options: { clients?: unknown[] } = {},
+): { api: never; spies: ApiSpies } {
   const createAndSetTotals = spies.createAndSetTotals ?? vi.fn().mockResolvedValue({
     id: 555, number: "INV-1", status: "PROJECT", clients_id: 7,
     client_name: "Supplier OU", cl_currencies_id: "EUR", create_date: "2026-03-20", gross_price: 124,
@@ -176,7 +182,7 @@ function makeApi(spies: Partial<ApiSpies> = {}): { api: never; spies: ApiSpies }
   const confirmWithTotals = spies.confirmWithTotals ?? vi.fn().mockResolvedValue(undefined);
   const invalidate = spies.invalidate ?? vi.fn().mockResolvedValue(undefined);
   const api = {
-    clients: { listAll: vi.fn().mockResolvedValue([]) },
+    clients: { listAll: vi.fn().mockResolvedValue(options.clients ?? []) },
     purchaseInvoices: {
       listAll: vi.fn().mockResolvedValue([]),
       createAndSetTotals,
@@ -372,6 +378,120 @@ describe("receipt batch typed operation", () => {
     expect(spies.confirmWithTotals).toHaveBeenCalledTimes(1);
     expect(spies.invalidate).toHaveBeenCalledTimes(1);
     expect(outcome.value.results[0]!.status).toBe("failed");
+  });
+});
+
+// E2E-FIX B3: the live E2E rerun's Kesko receipt — an image with no usable
+// text, read via the CRM's own structured OCR fields (extractReceiptFieldsFromCrmFields,
+// unmocked here). Proves the CRM-fields path plumbs through processSingleReceipt
+// to supplier resolution instead of stopping at classification, and that the
+// LiteParse note (which never ran under CRM_API_URL) is not attached.
+describe("receipt batch typed operation — CRM-fields image receipt (E2E-FIX B3)", () => {
+  it("suppresses the LiteParse note and resolves the supplier by registry code, using the REAL classifier / auto-bookable check / matcher (not the module mocks)", async () => {
+    // classifyReceiptDocument, hasAutoBookableReceiptFields and
+    // resolveSupplierInternal are `vi.fn()` mocks at the module level
+    // (primeExtraction sets fixed return values for the .pdf/text-parsed
+    // tests above). This test swaps in the real implementations so the
+    // structured-fields classification rule, the auto-bookable-fields check,
+    // and the registry-code match all actually execute end to end.
+    const realExtraction = await vi.importActual<typeof import("../tools/receipt-extraction.js")>(
+      "../tools/receipt-extraction.js",
+    );
+    const realSupplierResolution = await vi.importActual<typeof import("../tools/supplier-resolution.js")>(
+      "../tools/supplier-resolution.js",
+    );
+    vi.mocked(classifyReceiptDocument).mockImplementation(realExtraction.classifyReceiptDocument);
+    vi.mocked(hasAutoBookableReceiptFields).mockImplementation(realExtraction.hasAutoBookableReceiptFields);
+    vi.mocked(resolveSupplierInternal).mockImplementation(realSupplierResolution.resolveSupplierInternal);
+
+    // Mocked /counterparties response already carrying the Kesko supplier
+    // under its registry code — resolveSupplierInternal's registry-code match
+    // (supplier-default-resolution.ts) returns straight from this list, no
+    // network registry lookup.
+    const { api } = makeApi({}, {
+      clients: [{
+        id: 42,
+        code: "10026621",
+        name: "AS Kesko Senukai Estonia",
+        is_supplier: true,
+        is_client: false,
+        cl_code_country: "EST",
+        is_member: false,
+        send_invoice_to_email: false,
+        send_invoice_to_accounting_email: false,
+        is_deleted: false,
+      }],
+    });
+    // A live WhatsApp-forwarded filename — not "receipt.jpg" — because the
+    // real classifier's `hasReceiptKeywords` rule would otherwise match the
+    // word "receipt" in the filename itself before the CRM-fields rule is
+    // ever reached (there is no raw text to override it with).
+    const fileName = "WhatsApp Image 2026-01-03 at 12.34.56.jpg";
+    vi.mocked(readdir).mockResolvedValue([{ name: fileName, isFile: () => true }] as never);
+    vi.mocked(parseDocument).mockResolvedValue({
+      text: "",
+      pageCount: 1,
+      result: { pages: [] },
+      crmFields: {
+        fields: {
+          supplierName: "AS Kesko Senukai Estonia",
+          supplierRegNo: "10026621",
+          supplierVatNumber: "EE100269136",
+          invoiceNumber: "E309 20260103 04 084460",
+          amount: 18.60,
+          netAmount: 14.99,
+          vatAmount: 3.60,
+          currency: "EUR",
+          invoiceDate: "2026-01-03",
+        },
+        tier: "2",
+        confidence: "medium",
+      },
+    } as never);
+
+    const outcome = await makeOperations(api).runBatch({ ...baseRun, executionMode: "dry_run", dryRun: true });
+    expect(outcome.ok).toBe(true);
+    if (!outcome.ok) throw new Error("runBatch failed");
+    const row = outcome.value.results[0]!;
+    // The real classifier resolved the CRM-fields identity+number+total rule
+    // to purchase_invoice (never payment_receipt — CRM fields carry no
+    // reference to a SEPARATE invoice), the real hasAutoBookableReceiptFields
+    // passed, and the real matcher found the mocked client by registry code —
+    // none of that was faked by a mock return value.
+    expect(row.classification).toBe("purchase_invoice");
+    expect(row.extracted?.supplier_reg_code).toBe("10026621");
+    expect(row.extracted?.via_crm_fields).toBe(true);
+    expect(row.supplier_resolution?.found).toBe(true);
+    expect(row.supplier_resolution?.match_type).toBe("registry_code");
+    expect(row.supplier_resolution?.client?.id).toBe(42);
+    expect(row.status).toBe("dry_run_preview");
+  });
+
+  it("does not attach the LiteParse note for a CRM-fields document, even when it needs review", async () => {
+    const { api } = makeApi();
+    vi.mocked(readdir).mockResolvedValue([{ name: "receipt.jpg", isFile: () => true }] as never);
+    vi.mocked(parseDocument).mockResolvedValue({
+      text: "",
+      pageCount: 1,
+      result: { pages: [] },
+      crmFields: {
+        fields: { supplierName: "AS Kesko Senukai Estonia" },
+        tier: "2",
+        confidence: "low",
+      },
+    } as never);
+    // Missing invoice number / date / total: needs_review before booking.
+    vi.mocked(hasAutoBookableReceiptFields).mockReturnValue(false);
+
+    const outcome = await makeOperations(api).runBatch({ ...baseRun, executionMode: "dry_run", dryRun: true });
+    expect(outcome.ok).toBe(true);
+    if (!outcome.ok) throw new Error("runBatch failed");
+    const row = outcome.value.results[0]!;
+    expect(row.status).toBe("needs_review");
+    expect(row.extracted?.via_crm_fields).toBe(true);
+    expect(row.notes ?? []).not.toEqual(
+      expect.arrayContaining([expect.stringContaining("LiteParse")]),
+    );
   });
 });
 
